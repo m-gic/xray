@@ -14,7 +14,7 @@ const CONFIG = {
   UUID: process.env.UUID || '' || crypto.randomUUID(),
   CLOUDFLARE_TUNNEL_TOKEN: process.env.CLOUDFLARE_TUNNEL_TOKEN || '',
   CLOUDFLARE_IP: process.env.CLOUDFLARE_IP || '',
-  PORT: process.env.PORT || '',
+  PORT: /^0*$/.test(process.env.PORT || '') ? '' : process.env.PORT,
   VLESS_MODE: process.env.VLESS_MODE || '',
   VMESS_MODE: process.env.VMESS_MODE || '',
   TROJAN_MODE: process.env.TROJAN_MODE || '',
