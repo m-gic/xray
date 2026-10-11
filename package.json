@@ -1,0 +1,25 @@
+{
+  "name": "xray-js",
+  "version": "1.0.0",
+  "description": "Single-file Node.js deployer for Xray-core (VLESS / VMess / Trojan / Shadowsocks / Hysteria2 / Mixed / WireGuard), zero dependencies",
+  "main": "index.js",
+  "type": "commonjs",
+  "bin": {
+    "xray-js": "index.js"
+  },
+  "scripts": {
+    "start": "node index.js",
+    "check": "node --check index.js"
+  },
+  "engines": {
+    "node": ">=16"
+  },
+  "os": [
+    "linux"
+  ],
+  "cpu": [
+    "x64",
+    "arm64"
+  ],
+  "private": true
+}
