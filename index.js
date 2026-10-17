@@ -48,7 +48,11 @@ function readMode(key, defaultValue = '') { return readEnv(key, defaultValue).to
 function normalizeHost(text) { return text.replace(/^[a-z]+:\/\//i, '').replace(/[/:].*$/, ''); }
 
 // 把当前 UUID 写回脚本本身：下次运行直接沿用
-fs.writeFileSync(SELF, fs.readFileSync(SELF, 'utf8').replace(/^ {2}UUID: .*$/m, () => `  UUID: readEnv('UUID', '${UUID}') || crypto.randomUUID(),`));
+try {
+  fs.writeFileSync(SELF, fs.readFileSync(SELF, 'utf8').replace(/^ {2}UUID: .*$/m, () => `  UUID: readEnv('UUID', '${UUID}') || crypto.randomUUID(),`));
+} catch (error) {
+  console.error(`[UUID] Cannot persist UUID to script: ${error.message}`);
+}
 
 process.chdir(BASE_DIR);
 const ARCHITECTURE = { x64: 'amd64', arm64: 'arm64' }[process.arch];
@@ -215,6 +219,16 @@ function parseModes() {
 
 // 2. 把回落关系整理成 Reality 链
 function buildChains() {
+  // 回落目标没有 Reality 项(既没有端口、也没有再回落给别的协议)时，指向它的协议也当作空，并逐级向上传递
+  for (let changed = true; changed;) {
+    changed = false;
+    for (const [protocol, target] of Object.entries(FALLBACK)) {
+      if (NUMERIC_PORT[target] || FALLBACK[target]) continue;
+      console.log(`[MODE] ${protocol.toUpperCase()}_MODE='${target}': ${target.toUpperCase()} has no Reality port, so this fallback entry is ignored`);
+      delete FALLBACK[protocol];
+      changed = true;
+    }
+  }
   for (const [protocol, target] of Object.entries(FALLBACK)) {
     if (FALLBACK_PARENT[target]) die(`${target.toUpperCase()} is the fallback of both ${FALLBACK_PARENT[target].toUpperCase()} and ${protocol.toUpperCase()}, it can only have one`);
     FALLBACK_PARENT[target] = protocol;
@@ -228,7 +242,6 @@ function buildChains() {
     let tail = head;
     CHAIN[head] = [head];
     while (FALLBACK[tail]) { tail = FALLBACK[tail]; CHAIN[head].push(tail); }
-    if (!NUMERIC_PORT[tail]) die(`The chain from ${head.toUpperCase()} ends at ${tail.toUpperCase()}, which needs a port: set ${tail.toUpperCase()}_MODE to a port number`);
     HEAD_PORT[head] = NUMERIC_PORT[tail];
     for (const protocol of CHAIN[head]) REALITY_PORT[protocol] = HEAD_PORT[head];
   }
