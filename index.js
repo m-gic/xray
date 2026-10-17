@@ -29,14 +29,22 @@ const CONFIG = {
 };
 const {
   NAME, UUID, CLOUDFLARE_TUNNEL_TOKEN, CLOUDFLARE_IP, PORT, VLESS_MODE, VMESS_MODE, TROJAN_MODE, SHADOWSOCKS_MODE,
-  HYSTERIA2_MODE, MIXED_MODE, WIREGUARD_MODE, CERT_HOST, WORK_DIR, KOMARI_ENDPOINT, KOMARI_TOKEN,
+  HYSTERIA2_MODE, MIXED_MODE, WIREGUARD_MODE, CERT_HOST, KOMARI_ENDPOINT, KOMARI_TOKEN,
 } = CONFIG;
 console.log('[ENV]', Object.entries(CONFIG).filter(([, value]) => value).map(([key, value]) => `${key}=${/UUID|TOKEN/.test(key) ? `${value.slice(0, 4)}***` : value}`).join(' '));
 
-try {
-  fs.mkdirSync(WORK_DIR, { recursive: true });
-  fs.accessSync(WORK_DIR, fs.constants.R_OK | fs.constants.W_OK);
-} catch (error) { console.error(`[DIR] Cannot access WORK_DIR ${WORK_DIR}: ${error.message}`); process.exit(1); }
+// 先用 WORK_DIR，无法创建或读写时退回 /tmp/xray，仍不行就退出
+let WORK_DIR = '';
+for (const directory of new Set([CONFIG.WORK_DIR, '/tmp/xray'])) {
+  try {
+    fs.mkdirSync(directory, { recursive: true });
+    fs.accessSync(directory, fs.constants.R_OK | fs.constants.W_OK);
+    WORK_DIR = directory;
+    break;
+  } catch (error) { console.error(`[DIR] Cannot access ${directory}: ${error.message}`); }
+}
+if (!WORK_DIR) process.exit(1);
+if (WORK_DIR !== CONFIG.WORK_DIR) console.log(`[DIR] Falling back to ${WORK_DIR}`);
 
 function readLog(file) { try { return fs.readFileSync(file, 'utf8'); } catch { return ''; } }
 function readEnv(key, defaultValue = '') { return (process.env[key] ?? defaultValue).trim(); }
