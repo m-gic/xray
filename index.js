@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 'use strict';
-// 纯 Node.js 实现(>=16)，只用内置模块。每个 *_MODE 可用逗号分隔：一个前置模式 ws/cloudflare + 一个 Reality 项(端口或回落协议名)
+// 纯 Node.js(>=16)，仅内置模块。每个 *_MODE 可逗号分隔：一个前置模式 ws/cloudflare + 一个 Reality 项(端口或回落协议名)
 const requireBuiltin = (moduleName) => (typeof require === 'function' ? require(moduleName) : process.getBuiltinModule(`node:${moduleName}`));
 const [crypto, fs, path, childProcess, https, http, zlib, dns, tls] = ['crypto', 'fs', 'path', 'child_process', 'https', 'http', 'zlib', 'dns', 'tls'].map((moduleName) => requireBuiltin(moduleName));
 const { X509Certificate } = crypto;
@@ -22,51 +22,50 @@ const CONFIG = {
   HYSTERIA2_MODE: readEnv('HYSTERIA2_MODE'),
   MIXED_MODE: readEnv('MIXED_MODE'),
   WIREGUARD_MODE: readEnv('WIREGUARD_MODE'),
-  CERT_HOST: normalizeHost(readEnv('CERT_HOST')),
+  CERT_HOST: readEnv('CERT_HOST').replace(/^[a-z]+:\/\//i, '').replace(/[/:].*$/, ''),
+  WORK_DIR: path.resolve(BASE_DIR, readEnv('WORK_DIR', BASE_DIR)), // 下载的程序、日志、证书都放这里；留空 = 脚本所在目录
   KOMARI_ENDPOINT: readEnv('KOMARI_ENDPOINT'),
   KOMARI_TOKEN: readEnv('KOMARI_TOKEN'),
 };
 const {
   NAME, UUID, CLOUDFLARE_TUNNEL_TOKEN, CLOUDFLARE_IP, PORT, VLESS_MODE, VMESS_MODE, TROJAN_MODE, SHADOWSOCKS_MODE,
-  HYSTERIA2_MODE, MIXED_MODE, WIREGUARD_MODE, CERT_HOST, KOMARI_ENDPOINT, KOMARI_TOKEN,
+  HYSTERIA2_MODE, MIXED_MODE, WIREGUARD_MODE, CERT_HOST, WORK_DIR, KOMARI_ENDPOINT, KOMARI_TOKEN,
 } = CONFIG;
 console.log('[ENV]', Object.entries(CONFIG).filter(([, value]) => value).map(([key, value]) => `${key}=${/UUID|TOKEN/.test(key) ? `${value.slice(0, 4)}***` : value}`).join(' '));
 
+try {
+  fs.mkdirSync(WORK_DIR, { recursive: true });
+  fs.accessSync(WORK_DIR, fs.constants.R_OK | fs.constants.W_OK);
+} catch (error) { console.error(`[DIR] Cannot access WORK_DIR ${WORK_DIR}: ${error.message}`); process.exit(1); }
+
+function readLog(file) { try { return fs.readFileSync(file, 'utf8'); } catch { return ''; } }
+function readEnv(key, defaultValue = '') { return (process.env[key] ?? defaultValue).trim(); }
+function readMode(key, defaultValue = '') { return readEnv(key, defaultValue).toLowerCase(); }
 function loadEnv(file) {
   try { return process.loadEnvFile(file); } catch (error) { if (error.code === 'ENOENT') return; }
-  let text;
-  try { text = fs.readFileSync(file, 'utf8'); } catch { return; }
-  for (const line of text.split(/\r?\n/)) {
+  for (const line of readLog(file).split(/\r?\n/)) {
     const match = line.match(/^\s*(?:export\s+)?([A-Za-z_]\w*)\s*=\s*(.*)$/);
     if (!match || line.trim().startsWith('#')) continue;
     const rawValue = match[2].trim(), quoted = rawValue.match(/^(['"])(.*?)\1/);
     if (process.env[match[1]] === undefined) process.env[match[1]] = quoted ? quoted[2] : rawValue.replace(/\s+#.*$/, '');
   }
 }
-function readEnv(key, defaultValue = '') { return (process.env[key] ?? defaultValue).trim(); }
-function readMode(key, defaultValue = '') { return readEnv(key, defaultValue).toLowerCase(); }
-function normalizeHost(text) { return text.replace(/^[a-z]+:\/\//i, '').replace(/[/:].*$/, ''); }
 
 // 把当前 UUID 写回脚本本身：下次运行直接沿用
 try {
   fs.writeFileSync(SELF, fs.readFileSync(SELF, 'utf8').replace(/^ {2}UUID: .*$/m, () => `  UUID: readEnv('UUID', '${UUID}') || crypto.randomUUID(),`));
-} catch (error) {
-  console.error(`[UUID] Cannot persist UUID to script: ${error.message}`);
-}
+} catch (error) { console.error(`[UUID] Cannot persist UUID to script: ${error.message}`); }
 
-process.chdir(BASE_DIR);
+process.chdir(WORK_DIR);
 const ARCHITECTURE = { x64: 'amd64', arm64: 'arm64' }[process.arch];
 if (!ARCHITECTURE) { console.error(`[ARCH] Unsupported architecture: ${process.arch}`); process.exit(1); }
 
 // ========== 通用函数 ==========
 const toBase64 = (data) => Buffer.from(data).toString('base64');
-const toBase64Url = (data) => Buffer.from(data).toString('base64url');
 const sleep = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds));
 const validPort = (value) => /^[0-9]+$/.test(value) && +value >= 1 && +value <= 65535;
 const die = (message) => { console.error(`[MODE] ${message}`); process.exit(1); };
 const nonEmpty = (file) => { try { return fs.statSync(file).size > 0; } catch { return false; } };
-const readTrimmed = (file) => { try { return fs.readFileSync(file, 'utf8').trim(); } catch { return ''; } };
-const readLog = (file) => { try { return fs.readFileSync(file, 'utf8'); } catch { return ''; } };
 const urlEncode = (text) => encodeURIComponent(text).replace(/[!'()*]/g, (char) => `%${char.charCodeAt(0).toString(16).toUpperCase()}`);
 
 // HTTPS 请求：跟随重定向；file 非空时把响应体写进文件，否则返回 { status, body }
@@ -93,10 +92,11 @@ function request(url, { family, timeout = 10000, file = null, redirects = 5 } = 
 
 // 先写 .part 再改名，失败返回 false
 async function download(destination, url) {
+  let lastError;
   for (let attempt = 0; attempt < 3; attempt++) {
-    try { await request(url, { file: `${destination}.part` }); fs.renameSync(`${destination}.part`, destination); return true; } catch { fs.rmSync(`${destination}.part`, { force: true }); await sleep(1000); }
+    try { await request(url, { file: `${destination}.part` }); fs.renameSync(`${destination}.part`, destination); return true; } catch (error) { lastError = error; fs.rmSync(`${destination}.part`, { force: true }); await sleep(1000); }
   }
-  console.error(`[DL] Download failed: ${url}`);
+  console.error(`[DL] Download failed: ${url} (${[lastError?.code, lastError?.message].filter(Boolean).join(' ') || 'unknown error'})`);
   return false;
 }
 
@@ -129,7 +129,7 @@ async function unzip(zipFile, directory) {
 
 // Go 程序的内存参数：GOGC 调低；有容器内存限制时设 GOMEMLIMIT 软上限
 const GO_ENV = (() => {
-  const memoryLimit = +(readTrimmed('/sys/fs/cgroup/memory.max') || readTrimmed('/sys/fs/cgroup/memory/memory.limit_in_bytes'));
+  const memoryLimit = +(readLog('/sys/fs/cgroup/memory.max').trim() || readLog('/sys/fs/cgroup/memory/memory.limit_in_bytes').trim());
   return { GOGC: '50', ...(memoryLimit > 0 && memoryLimit < 2 ** 40 ? { GOMEMLIMIT: `${Math.floor(memoryLimit * 0.6 / 1048576)}MiB` } : {}) };
 })();
 
@@ -219,7 +219,7 @@ function parseModes() {
 
 // 2. 把回落关系整理成 Reality 链
 function buildChains() {
-  // 回落目标没有 Reality 项(既没有端口、也没有再回落给别的协议)时，指向它的协议也当作空，并逐级向上传递
+  // 回落目标没有 Reality 项时，指向它的协议也当作空，并逐级向上传递
   for (let changed = true; changed;) {
     changed = false;
     for (const [protocol, target] of Object.entries(FALLBACK)) {
@@ -271,7 +271,7 @@ function checkPorts() {
 }
 
 // ========== TLS 证书(供 ws / Hysteria2 使用) ==========
-// CERT_HOST 是域名且脚本目录下有 $CERT_HOST.crt/.key 并且可信 -> 使用；否则自签证书
+// CERT_HOST 是域名且 WORK_DIR 下有 $CERT_HOST.crt/.key 并且可信 -> 使用；否则自签证书
 const IPV4_PATTERN = /^[0-9]{1,3}(\.[0-9]{1,3}){3}$/;
 let CERT_FILE = '', KEY_FILE = '', TLS_SERVER_NAME = '', TLS_INSECURE = true, TLS_PINNED_CERT_SHA256 = '';
 
@@ -291,7 +291,7 @@ const Der = {
 
 // 自签证书(RSA 2048，10 年)；已有且 30 天内不过期就复用(否则证书哈希变化会使订阅失效)
 function generateSelfSignedCert(commonName) {
-  const directory = path.join(BASE_DIR, '.selfsigned');
+  const directory = path.join(WORK_DIR, '.selfsigned');
   fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
   CERT_FILE = path.join(directory, `${commonName}.crt`); KEY_FILE = path.join(directory, `${commonName}.key`);
   if (nonEmpty(CERT_FILE) && nonEmpty(KEY_FILE)) {
@@ -330,7 +330,7 @@ function verifyChain(certificates, hostname) {
 }
 
 function trustedCertForHost(hostname) {
-  const certFile = path.join(BASE_DIR, `${hostname}.crt`), keyFile = path.join(BASE_DIR, `${hostname}.key`);
+  const certFile = path.join(WORK_DIR, `${hostname}.crt`), keyFile = path.join(WORK_DIR, `${hostname}.key`);
   if (!nonEmpty(certFile) || !nonEmpty(keyFile)) return false;
   let certificates;
   try {
@@ -348,7 +348,7 @@ function setupTls() {
   TLS_SERVER_NAME = CERT_HOST || 'www.nazhumi.com';
   TLS_INSECURE = !(CERT_HOST && !IPV4_PATTERN.test(CERT_HOST) && trustedCertForHost(CERT_HOST));
   if (TLS_INSECURE) {
-    console.error(`[TLS] No trusted certificate available (put one at ${BASE_DIR}/<CERT_HOST>.crt and .key), using self-signed certificate`);
+    console.error(`[TLS] No trusted certificate available (put one at ${WORK_DIR}/<CERT_HOST>.crt and .key), using self-signed certificate`);
     generateSelfSignedCert(TLS_SERVER_NAME);
     TLS_PINNED_CERT_SHA256 = new X509Certificate(fs.readFileSync(CERT_FILE)).fingerprint256.replace(/:/g, '').toLowerCase(); // 新版客户端用证书哈希固定(链接里的 pcs)
   }
@@ -492,7 +492,7 @@ function wsLink(protocol, wsInfo, name) {
     }))}`; // ?ed=2560 为 0-RTT early data
     case 'shadowsocks': { // v2ray-plugin 无法跳过证书校验，自签证书下不输出
       if (ACTIVE_MODE === 'ws' && TLS_INSECURE) {
-        console.error(`[MODE] ws mode: Shadowsocks (v2ray-plugin) needs a trusted certificate, put one at ${BASE_DIR}/<CERT_HOST>.crt and .key. No SS link generated`);
+        console.error(`[MODE] ws mode: Shadowsocks (v2ray-plugin) needs a trusted certificate, put one at ${WORK_DIR}/<CERT_HOST>.crt and .key. No SS link generated`);
         return '';
       }
       const plugin = `v2ray-plugin;tls;host=${wsInfo.host};path=${wsPath};mux=0`.replace(/;/g, '%3B').replace(/=/g, '%3D').replace(/\//g, '%2F');
@@ -535,7 +535,7 @@ function startWeb(subscriptionBody) {
 
 // ========== 外部程序 ==========
 async function fetchBinary(fileName, url) {
-  const binary = path.join(BASE_DIR, fileName);
+  const binary = path.join(WORK_DIR, fileName);
   if (!await download(binary, url)) process.exit(1);
   fs.chmodSync(binary, 0o755);
   return binary;
@@ -547,7 +547,7 @@ async function startKomari() {
   const binary = await fetchBinary('komari-agent', `https://github.com/komari-monitor/komari-agent/releases/latest/download/komari-agent-linux-${ARCHITECTURE}`);
   const agentEnv = { AGENT_ENDPOINT: KOMARI_ENDPOINT, AGENT_TOKEN: KOMARI_TOKEN }; // 只传给这个进程
   if (XRAY_ON) {
-    spawnBackground(binary, [], path.join(BASE_DIR, 'komari-agent.log'), agentEnv);
+    spawnBackground(binary, [], path.join(WORK_DIR, 'komari-agent.log'), agentEnv);
     return console.log(`[KOMARI] Agent started, reporting to ${KOMARI_ENDPOINT}`);
   }
   console.log(`[KOMARI] No proxy protocol enabled, running the agent only, reporting to ${KOMARI_ENDPOINT}`);
@@ -574,7 +574,7 @@ function parseIngress(text) {
 async function startCloudflared() {
   await killPrevious('cloudflared', 'CF');
   const binary = await fetchBinary('cloudflared', `https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${ARCHITECTURE}`);
-  const logFile = path.join(BASE_DIR, 'cloudflared.log');
+  const logFile = path.join(WORK_DIR, 'cloudflared.log');
   childProcess.spawnSync(binary, ['--version'], { stdio: 'inherit' });
 
   if (QUICK_TUNNEL) {
@@ -624,7 +624,7 @@ async function main() {
     [WIREGUARD_SERVER_PRIVATE, WIREGUARD_SERVER_PUBLIC] = deriveKey('wg-server', 'base64');
     [WIREGUARD_CLIENT_PRIVATE, WIREGUARD_CLIENT_PUBLIC] = deriveKey('wg-client', 'base64');
   }
-  SHADOWSOCKS_USERINFO = toBase64Url(`aes-256-gcm:${UUID}`);
+  SHADOWSOCKS_USERINFO = Buffer.from(`aes-256-gcm:${UUID}`).toString('base64url');
 
   if (ACTIVE_MODE !== 'cloudflare' || CHAIN_HEADS.length || HYSTERIA2_PORT || MIXED_PORT || WIREGUARD_PORT) await resolvePublicAddress();
   IPV6_AVAILABLE = await request(TRACE_URL, { family: 6, timeout: 5000 }).then(() => true, () => false);
@@ -633,8 +633,7 @@ async function main() {
   if (ACTIVE_MODE === 'cloudflare' && CLOUDFLARE_TUNNEL_TOKEN) await startCloudflared();
 
   // ---- Xray ----
-  const xrayDirectory = path.join(BASE_DIR, 'xray'), xrayBinary = path.join(xrayDirectory, 'xray'), xrayConfigFile = path.join(xrayDirectory, 'config.json'), zipFile = path.join(BASE_DIR, 'xray.zip');
-  fs.mkdirSync(xrayDirectory, { recursive: true });
+  const xrayDirectory = WORK_DIR, xrayBinary = path.join(xrayDirectory, 'xray'), xrayConfigFile = path.join(xrayDirectory, 'config.json'), zipFile = path.join(WORK_DIR, 'xray.zip');
   if (!await download(zipFile, `https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-${ARCHITECTURE === 'amd64' ? '64' : 'arm64-v8a'}.zip`)) process.exit(1);
   await unzip(zipFile, xrayDirectory);
   fs.rmSync(zipFile, { force: true });
