@@ -3,36 +3,60 @@
 // 纯 Node.js 实现，只用内置模块，不需要 npm install / openssl / unzip / curl；需要 Node.js 16 及以上
 // 多模式：每个 *_MODE 可用逗号分隔，例如 VLESS_MODE=ws,443 (一个前置模式 ws/cloudflare + 一个 Reality 项：端口或回落协议名)
 const bi = (m) => (typeof require === 'function' ? require(m) : process.getBuiltinModule(`node:${m}`)); // CJS 用 require；ESM 用 getBuiltinModule(Node 22.3+)
-const crypto = bi('crypto'), fs = bi('fs'), path = bi('path'), cp = bi('child_process');
-const https = bi('https'), http = bi('http'), zlib = bi('zlib'), dns = bi('dns'), tls = bi('tls');
-const { X509Certificate } = crypto;
+const crypto = bi('crypto'), fs = bi('fs'), path = bi('path'); // 配置段只依赖这三个，其余内置模块放到配置段后面
 const SELF = path.resolve(process.argv[1]), BASE_DIR = path.dirname(SELF);
 
 // ========== 用户配置 ==========
-const CONFIG = {
-  NAME: process.env.NAME || '',
-  UUID: process.env.UUID || '' || crypto.randomUUID(),
-  CLOUDFLARE_TUNNEL_TOKEN: process.env.CLOUDFLARE_TUNNEL_TOKEN || '',
-  CLOUDFLARE_IP: process.env.CLOUDFLARE_IP || 'visa.cn',
-  PORT: /^0*$/.test(process.env.PORT || '') ? '' : process.env.PORT,
-  VLESS_MODE: process.env.VLESS_MODE || 'trojan',
-  VMESS_MODE: process.env.VMESS_MODE || '',
-  TROJAN_MODE: process.env.TROJAN_MODE || 'vmess',
-  SHADOWSOCKS_MODE: process.env.SHADOWSOCKS_MODE || '',
-  HYSTERIA2_MODE: process.env.HYSTERIA2_MODE || '',
-  MIXED_MODE: process.env.MIXED_MODE || '',
-  WIREGUARD_MODE: process.env.WIREGUARD_MODE || '',
-  CERT_HOST: process.env.CERT_HOST || '',
-  KOMARI_ENDPOINT: process.env.KOMARI_ENDPOINT || '',
-  KOMARI_TOKEN: process.env.KOMARI_TOKEN || '',
+// 优先级：真实环境变量 > 同目录 .env > 这里的默认值。变量"未设置"才用默认值，设成空就是关闭
+loadEnv(path.join(BASE_DIR, '.env'));
+const CONFIG = {                                     // 第二个参数是默认值，需要的话直接改它
+  NAME: env('NAME', ''),
+  UUID: env('UUID', '') || crypto.randomUUID(),
+  CLOUDFLARE_TUNNEL_TOKEN: env('CLOUDFLARE_TUNNEL_TOKEN', ''),
+  CLOUDFLARE_IP: env('CLOUDFLARE_IP', 'visa.cn'),
+  PORT: env('PORT', '').replace(/^0+$/, ''),         // 空或全是 0 都当作未设置
+  VLESS_MODE: mode('VLESS_MODE', 'trojan'),
+  VMESS_MODE: mode('VMESS_MODE', ''),
+  TROJAN_MODE: mode('TROJAN_MODE', 'vmess'),
+  SHADOWSOCKS_MODE: mode('SHADOWSOCKS_MODE', ''),
+  HYSTERIA2_MODE: env('HYSTERIA2_MODE', ''),
+  MIXED_MODE: env('MIXED_MODE', ''),
+  WIREGUARD_MODE: env('WIREGUARD_MODE', ''),
+  CERT_HOST: host(env('CERT_HOST', '')),
+  KOMARI_ENDPOINT: env('KOMARI_ENDPOINT', ''),
+  KOMARI_TOKEN: env('KOMARI_TOKEN', ''),
 };
 const {
   NAME, UUID, CLOUDFLARE_TUNNEL_TOKEN, CLOUDFLARE_IP, PORT, VLESS_MODE, VMESS_MODE, TROJAN_MODE, SHADOWSOCKS_MODE,
   HYSTERIA2_MODE, MIXED_MODE, WIREGUARD_MODE, CERT_HOST, KOMARI_ENDPOINT, KOMARI_TOKEN,
 } = CONFIG;
+// 打印生效的配置(UUID / Token 只显示前 4 位)，方便排查"变量没读到"
+console.log('[ENV]', Object.entries(CONFIG).filter(([, v]) => v).map(([k, v]) => `${k}=${/UUID|TOKEN/.test(k) ? `${v.slice(0, 4)}***` : v}`).join(' '));
 
-// 把当前 UUID 写回脚本本身(填进上面 UUID 那行的 '' 里)：下次运行直接沿用，不做任何检测
-fs.writeFileSync(SELF, fs.readFileSync(SELF, 'utf8').replace(/^ {2}UUID: .*$/m, () => `  UUID: process.env.UUID || '${UUID}' || crypto.randomUUID(),`));
+// 配置用到的辅助函数：用函数声明(会被提升)，所以可以写在 CONFIG 下面
+function loadEnv(file) {
+  try { return process.loadEnvFile(file); } catch (e) { if (e.code === 'ENOENT') return; } // Node 20.12+ 自带，不覆盖已有变量
+  let text;
+  try { text = fs.readFileSync(file, 'utf8'); } catch { return; }
+  for (const line of text.split(/\r?\n/)) {
+    const m = line.match(/^\s*(?:export\s+)?([A-Za-z_]\w*)\s*=\s*(.*)$/);
+    if (!m || line.trim().startsWith('#')) continue;
+    let v = m[2].trim();
+    const q = v.match(/^(['"])(.*?)\1/);
+    v = q ? q[2] : v.replace(/\s+#.*$/, ''); // 引号内原样保留，否则去掉行尾注释
+    if (process.env[m[1]] === undefined) process.env[m[1]] = v;
+  }
+}
+function env(k, def = '') { return (process.env[k] ?? def).trim(); } // 变量未设置 -> 用 def；设成空 -> 空(关闭)
+function mode(k, def = '') { return env(k, def).toLowerCase(); }
+function host(s) { return s.replace(/^[a-z]+:\/\//i, '').replace(/[/:].*$/, ''); } // 去掉协议、路径、端口
+
+const cp = bi('child_process');
+const https = bi('https'), http = bi('http'), zlib = bi('zlib'), dns = bi('dns'), tls = bi('tls');
+const { X509Certificate } = crypto;
+
+// 把当前 UUID 写回脚本本身(填进上面 UUID 那行 env('UUID', '') 的默认值里)：下次运行直接沿用，不做任何检测
+fs.writeFileSync(SELF, fs.readFileSync(SELF, 'utf8').replace(/^ {2}UUID: .*$/m, () => `  UUID: env('UUID', '${UUID}') || crypto.randomUUID(),`));
 
 process.chdir(BASE_DIR);
 const ARCH = { x64: 'amd64', arm64: 'arm64' }[process.arch];
