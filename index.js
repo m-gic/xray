@@ -10,22 +10,22 @@ const SELF = path.resolve(process.argv[1]), BASE_DIR = path.dirname(SELF);
 // 优先级：真实环境变量 > 同目录 .env > 默认值。变量"未设置"才用默认值，设成空就是关闭
 loadEnv(path.join(BASE_DIR, '.env'));
 const CONFIG = {
-  NAME: readEnv('NAME'),
+  NAME: readEnv('NAME', ''),
   UUID: readEnv('UUID', '') || crypto.randomUUID(),
   CLOUDFLARE_TUNNEL_TOKEN: readEnv('CLOUDFLARE_TUNNEL_TOKEN'),
   CLOUDFLARE_IP: readEnv('CLOUDFLARE_IP', 'visa.cn'),
-  PORT: readEnv('PORT').replace(/^0+$/, ''),
+  PORT: readEnv('PORT', '').replace(/^0+$/, ''),
   VLESS_MODE: readMode('VLESS_MODE', 'trojan'),
-  VMESS_MODE: readMode('VMESS_MODE'),
+  VMESS_MODE: readMode('VMESS_MODE', ''),
   TROJAN_MODE: readMode('TROJAN_MODE', 'vmess'),
   SHADOWSOCKS_MODE: readMode('SHADOWSOCKS_MODE'),
-  HYSTERIA2_MODE: readEnv('HYSTERIA2_MODE'),
+  HYSTERIA2_MODE: readEnv('HYSTERIA2_MODE', ''),
   MIXED_MODE: readEnv('MIXED_MODE'),
   WIREGUARD_MODE: readEnv('WIREGUARD_MODE'),
-  CERT_HOST: readEnv('CERT_HOST').replace(/^[a-z]+:\/\//i, '').replace(/[/:].*$/, ''),
+  CERT_HOST: readEnv('CERT_HOST', '').replace(/^[a-z]+:\/\//i, '').replace(/[/:].*$/, ''),
   WORK_DIR: path.resolve(BASE_DIR, readEnv('WORK_DIR', BASE_DIR)), // 下载的程序、日志、证书都放这里；留空 = 脚本所在目录
-  KOMARI_ENDPOINT: readEnv('KOMARI_ENDPOINT'),
-  KOMARI_TOKEN: readEnv('KOMARI_TOKEN'),
+  KOMARI_ENDPOINT: readEnv('KOMARI_ENDPOINT', ''),
+  KOMARI_TOKEN: readEnv('KOMARI_TOKEN', ''),
 };
 const {
   NAME, UUID, CLOUDFLARE_TUNNEL_TOKEN, CLOUDFLARE_IP, PORT, VLESS_MODE, VMESS_MODE, TROJAN_MODE, SHADOWSOCKS_MODE,
