@@ -16,7 +16,7 @@ const CONFIG = {
   UUID: env('UUID') || crypto.randomUUID(),
   CLOUDFLARE_TUNNEL_TOKEN: env('CLOUDFLARE_TUNNEL_TOKEN'),
   CLOUDFLARE_IP: env('CLOUDFLARE_IP', 'visa.cn'),
-  PORT: env('PORT').replace(/^0+$/, ''),
+  PORT: env('PORT', '').replace(/^0+$/, ''),
   VLESS_MODE: mode('VLESS_MODE', 'trojan'),
   VMESS_MODE: mode('VMESS_MODE', ''),
   TROJAN_MODE: mode('TROJAN_MODE', 'vmess'),
