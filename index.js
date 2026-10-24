@@ -12,22 +12,22 @@ loadEnv(path.join(BASE_DIR, '.env'));
 const env = (k, d = '') => (process.env[k] ?? d).trim();
 const mode = (k, d = '') => env(k, d).toLowerCase();
 const CONFIG = {
-  NAME: env('NAME'),
+  NAME: env('NAME', ''),
   UUID: env('UUID') || crypto.randomUUID(),
   CLOUDFLARE_TUNNEL_TOKEN: env('CLOUDFLARE_TUNNEL_TOKEN'),
   CLOUDFLARE_IP: env('CLOUDFLARE_IP', 'visa.cn'),
   PORT: env('PORT').replace(/^0+$/, ''),
   VLESS_MODE: mode('VLESS_MODE', 'trojan'),
-  VMESS_MODE: mode('VMESS_MODE'),
+  VMESS_MODE: mode('VMESS_MODE', ''),
   TROJAN_MODE: mode('TROJAN_MODE', 'vmess'),
   SHADOWSOCKS_MODE: mode('SHADOWSOCKS_MODE'),
-  HYSTERIA2_MODE: env('HYSTERIA2_MODE'),
+  HYSTERIA2_MODE: env('HYSTERIA2_MODE', ''),
   MIXED_MODE: env('MIXED_MODE'),
   WIREGUARD_MODE: env('WIREGUARD_MODE'),
-  CERT_HOST: env('CERT_HOST').replace(/^[a-z]+:\/\//i, '').replace(/[/:].*$/, ''),
+  CERT_HOST: env('CERT_HOST', '').replace(/^[a-z]+:\/\//i, '').replace(/[/:].*$/, ''),
   WORK_DIR: env('WORK_DIR'), // 留空时由 NAME + UUID 自动派生看起来像系统缓存的路径
-  KOMARI_ENDPOINT: env('KOMARI_ENDPOINT'),
-  KOMARI_TOKEN: env('KOMARI_TOKEN'),
+  KOMARI_ENDPOINT: env('KOMARI_ENDPOINT', ''),
+  KOMARI_TOKEN: env('KOMARI_TOKEN', ''),
   LOG_LEVEL: mode('LOG_LEVEL', 'warning'), // none / error / warning / info / debug
 };
 const { NAME, UUID, CLOUDFLARE_TUNNEL_TOKEN, CLOUDFLARE_IP, PORT, VLESS_MODE, VMESS_MODE, TROJAN_MODE, SHADOWSOCKS_MODE,
