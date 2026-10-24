@@ -15,7 +15,7 @@ const CONFIG = {
   NAME: env('NAME', ''),
   UUID: env('UUID') || crypto.randomUUID(),
   CLOUDFLARE_TUNNEL_TOKEN: env('CLOUDFLARE_TUNNEL_TOKEN'),
-  CLOUDFLARE_IP: env('CLOUDFLARE_IP', 'visa.cn'),
+  CLOUDFLARE_IP: env('CLOUDFLARE_IP', 'www.gov.tw'),
   PORT: env('PORT', '').replace(/^0+$/, ''),
   CERT_HOST: env('CERT_HOST', '').replace(/^[a-z]+:\/\//i, '').replace(/[/:].*$/, ''),
   VLESS_MODE: mode('VLESS_MODE', 'trojan'),
