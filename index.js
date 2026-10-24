@@ -16,8 +16,8 @@ const CONFIG = {
   UUID: env('UUID') || crypto.randomUUID(),
   CLOUDFLARE_TUNNEL_TOKEN: env('CLOUDFLARE_TUNNEL_TOKEN'),
   CLOUDFLARE_IP: env('CLOUDFLARE_IP', 'visa.cn'),
-  PORT: env('PORT', '').replace(/^0+$/, ''),
-  CERT_HOST: env('CERT_HOST', '').replace(/^[a-z]+:\/\//i, '').replace(/[/:].*$/, ''),
+  PORT: env('PORT').replace(/^0+$/, ''),
+  CERT_HOST: env('CERT_HOST').replace(/^[a-z]+:\/\//i, '').replace(/[/:].*$/, ''),
   VLESS_MODE: mode('VLESS_MODE', 'trojan'),
   VMESS_MODE: mode('VMESS_MODE', ''),
   TROJAN_MODE: mode('TROJAN_MODE', 'vmess'),
@@ -32,6 +32,12 @@ const CONFIG = {
 };
 const { NAME, UUID, CLOUDFLARE_TUNNEL_TOKEN, CLOUDFLARE_IP, PORT, VLESS_MODE, VMESS_MODE, TROJAN_MODE, SHADOWSOCKS_MODE,
   HYSTERIA2_MODE, MIXED_MODE, WIREGUARD_MODE, CERT_HOST, KOMARI_ENDPOINT, KOMARI_TOKEN, LOG_LEVEL } = CONFIG;
+
+// LOG_LEVEL=none：屏蔽所有控制台输出；子进程输出也丢弃
+const QUIET = LOG_LEVEL === 'none';
+if (QUIET) console.log = console.error = () => {};
+const STDIO = QUIET ? 'ignore' : 'inherit';
+
 // Xray 进程名：只保留字母数字 . _ -，最长 15 个字符；为空则用 xray
 const PROCESS_NAME = NAME.replace(/[^A-Za-z0-9._-]/g, '').slice(0, 15) || 'xray';
 
@@ -40,6 +46,11 @@ const nameSlug = NAME.replace(/[^a-z0-9]/gi, '').toLowerCase().slice(0, 8) || 'c
 const uuidHash = crypto.createHash('sha256').update(UUID).digest('hex');
 const CACHE_DIR_NAME = `.${nameSlug}${uuidHash.slice(0, 4)}`;
 const SERVICE_NAME = `${nameSlug}-${uuidHash.slice(0, 6)}`;
+
+// Komari / cloudflared 的进程名：与 Xray 区分，形如 mynode-k2a3f、mynode-c2a3f
+const procBase = NAME.replace(/[^A-Za-z0-9._-]/g, '').slice(0, 9) || 'svc';
+const KOMARI_PROCESS = `${procBase}-k${uuidHash.slice(0, 4)}`;
+const CF_PROCESS = `${procBase}-c${uuidHash.slice(0, 4)}`;
 
 console.log('[ENV]', Object.entries(CONFIG).filter(([, v]) => v).map(([k, v]) => `${k}=${/UUID|TOKEN/.test(k) ? `${v.slice(0, 4)}***` : v}`).join(' '));
 
@@ -69,7 +80,7 @@ function loadEnv(file) {
 
 // 把当前 UUID 写回脚本本身：下次运行直接沿用
 try {
-  fs.writeFileSync(SELF, fs.readFileSync(SELF, 'utf8').replace(/^ {2}UUID: .*$/m, () => `  UUID: env('UUID') || crypto.randomUUID(),`.replace("env('UUID')", `env('UUID', '${UUID}')`)));
+  fs.writeFileSync(SELF, fs.readFileSync(SELF, 'utf8').replace(/^ {2}UUID: .*$/m, () => `  UUID: env('UUID', '${UUID}') || crypto.randomUUID(),`));
 } catch (e) { console.error(`[UUID] Cannot persist UUID to script: ${e.message}`); }
 
 process.chdir(WORK_DIR);
@@ -549,8 +560,9 @@ function startWeb(subBody) {
 }
 
 // ========== 外部程序 ==========
-async function fetchBinary(fileName, url) {
-  const bin = path.join(WORK_DIR, fileName);
+// 下载到 WORK_DIR/<进程名>，文件名即进程名，ps / top 里显示的就是它
+async function fetchBinary(processName, url) {
+  const bin = path.join(WORK_DIR, processName);
   if (!await download(bin, url)) process.exit(1);
   fs.chmodSync(bin, 0o755);
   return bin;
@@ -558,15 +570,15 @@ async function fetchBinary(fileName, url) {
 
 // Komari 探针：有代理协议时后台运行；没有时前台运行
 async function startKomari() {
-  await killPrevious('komari-agent', 'KOMARI');
-  const bin = await fetchBinary('komari-agent', `https://github.com/komari-monitor/komari-agent/releases/latest/download/komari-agent-linux-${ARCH}`);
+  await killPrevious(KOMARI_PROCESS, 'KOMARI');
+  const bin = await fetchBinary(KOMARI_PROCESS, `https://github.com/komari-monitor/komari-agent/releases/latest/download/komari-agent-linux-${ARCH}`);
   const agentEnv = { AGENT_ENDPOINT: KOMARI_ENDPOINT, AGENT_TOKEN: KOMARI_TOKEN };
   if (XRAY_ON) {
-    spawnBackground(bin, [], path.join(WORK_DIR, 'komari-agent.log'), agentEnv);
+    spawnBackground(bin, [], QUIET ? '/dev/null' : path.join(WORK_DIR, `${KOMARI_PROCESS}.log`), agentEnv);
     return console.log(`[KOMARI] Agent started, reporting to ${KOMARI_ENDPOINT}`);
   }
   console.log(`[KOMARI] No proxy protocol enabled, running the agent only, reporting to ${KOMARI_ENDPOINT}`);
-  const child = cp.spawn(bin, [], { env: { ...process.env, ...GO_ENV, ...agentEnv }, stdio: 'inherit' });
+  const child = cp.spawn(bin, [], { env: { ...process.env, ...GO_ENV, ...agentEnv }, stdio: STDIO });
   children.push(child);
   child.on('exit', (code) => process.exit(code ?? 1));
   await new Promise(() => {});
@@ -586,11 +598,13 @@ function parseIngress(text) {
 }
 
 // cloudflare 模式：Token 跑固定隧道；填 try 用临时隧道。域名和回源端口都从日志取
+// 日志文件只用于解析域名，LOG_LEVEL=none 时解析完即删除
 async function startCloudflared() {
-  await killPrevious('cloudflared', 'CF');
-  const bin = await fetchBinary('cloudflared', `https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${ARCH}`);
-  const logFile = path.join(WORK_DIR, 'cloudflared.log');
-  cp.spawnSync(bin, ['--version'], { stdio: 'inherit' });
+  await killPrevious(CF_PROCESS, 'CF');
+  const bin = await fetchBinary(CF_PROCESS, `https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${ARCH}`);
+  const logFile = path.join(WORK_DIR, `${CF_PROCESS}.log`);
+  const discardLog = () => { if (QUIET) fs.rmSync(logFile, { force: true }); };
+  cp.spawnSync(bin, ['--version'], { stdio: STDIO });
 
   if (QUICK_TUNNEL) {
     spawnBackground(bin, ['--no-autoupdate', 'tunnel', '--url', `http://localhost:${FRONT_PORT}`], logFile);
@@ -600,7 +614,7 @@ async function startCloudflared() {
     }
     if (CF_HOSTNAME) console.log(`[CF] Quick tunnel hostname from log: ${CF_HOSTNAME} (service port=${FRONT_PORT})`);
     else console.error(`[CF] Cannot find the trycloudflare.com hostname in ${logFile}`);
-    return;
+    return discardLog();
   }
 
   spawnBackground(bin, ['--no-autoupdate', 'tunnel', 'run'], logFile, { TUNNEL_TOKEN: CLOUDFLARE_TUNNEL_TOKEN });
@@ -612,6 +626,7 @@ async function startCloudflared() {
     checkPorts();
     console.log(`[CF] From cloudflared log: hostname=${CF_HOSTNAME}, tunnel service port=${FRONT_PORT}`);
   } else console.error(`[CF] Cannot read hostname / port from ${logFile} (the tunnel needs a Public hostname without * and a Service like http://localhost:PORT)`);
+  discardLog();
 }
 
 // ========== 主流程 ==========
@@ -660,7 +675,7 @@ async function main() {
   try { fs.chmodSync(xrayBinary, 0o755); } catch { /* 下面统一检查 */ }
   if (!nonEmpty(xrayBinary)) { console.error(`[XRAY] Binary not found after extraction: ${xrayBinary}`); process.exit(1); }
   const xrayEnv = { ...process.env, ...GO_ENV, XRAY_LOCATION_ASSET: WORK_DIR };
-  const runXray = (args) => cp.spawnSync(xrayBinary, args, { stdio: 'inherit', env: xrayEnv });
+  const runXray = (args) => cp.spawnSync(xrayBinary, args, { stdio: STDIO, env: xrayEnv });
   runXray(['version']);
 
   fs.writeFileSync(configFile, '', { mode: 0o600 }); // 先收紧权限再写入(含 UUID 和 Reality 私钥)
@@ -696,7 +711,7 @@ async function main() {
   console.log(`systemctl daemon-reload && systemctl enable --now ${SERVICE_NAME}`);
 
   try { req('v8').setFlagsFromString('--expose-gc'); req('vm').runInNewContext('gc')(); } catch { /* 没有就算了 */ }
-  const xrayProcess = cp.spawn(xrayBinary, ['run', '-c', configFile], { stdio: 'inherit', env: xrayEnv });
+  const xrayProcess = cp.spawn(xrayBinary, ['run', '-c', configFile], { stdio: STDIO, env: xrayEnv });
   children.push(xrayProcess);
   xrayProcess.on('exit', (code) => process.exit(code ?? 1));
 }
