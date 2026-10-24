@@ -17,6 +17,7 @@ const CONFIG = {
   CLOUDFLARE_TUNNEL_TOKEN: env('CLOUDFLARE_TUNNEL_TOKEN'),
   CLOUDFLARE_IP: env('CLOUDFLARE_IP', 'visa.cn'),
   PORT: env('PORT', '').replace(/^0+$/, ''),
+  CERT_HOST: env('CERT_HOST', '').replace(/^[a-z]+:\/\//i, '').replace(/[/:].*$/, ''),
   VLESS_MODE: mode('VLESS_MODE', 'trojan'),
   VMESS_MODE: mode('VMESS_MODE', ''),
   TROJAN_MODE: mode('TROJAN_MODE', 'vmess'),
@@ -24,7 +25,6 @@ const CONFIG = {
   HYSTERIA2_MODE: env('HYSTERIA2_MODE', ''),
   MIXED_MODE: env('MIXED_MODE'),
   WIREGUARD_MODE: env('WIREGUARD_MODE'),
-  CERT_HOST: env('CERT_HOST', '').replace(/^[a-z]+:\/\//i, '').replace(/[/:].*$/, ''),
   WORK_DIR: env('WORK_DIR'), // 留空时由 NAME + UUID 自动派生看起来像系统缓存的路径
   KOMARI_ENDPOINT: env('KOMARI_ENDPOINT', ''),
   KOMARI_TOKEN: env('KOMARI_TOKEN', ''),
