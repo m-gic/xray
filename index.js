@@ -1,35 +1,35 @@
 #!/usr/bin/env node
 'use strict';
 // 纯 Node.js(>=16)，除自签证书需要系统 openssl 外仅使用内置模块
-const req = (m) => (typeof require === 'function' ? require(m) : process.getBuiltinModule(`node:${m}`));
-const [crypto, fs, path, cp, https, http, zlib, dns, tls] = ['crypto', 'fs', 'path', 'child_process', 'https', 'http', 'zlib', 'dns', 'tls'].map(req);
+const requireBuiltin = (moduleName) => (typeof require === 'function' ? require(moduleName) : process.getBuiltinModule(`node:${moduleName}`));
+const [crypto, fs, path, childProcess, https, http, zlib, dns, tls] = ['crypto', 'fs', 'path', 'child_process', 'https', 'http', 'zlib', 'dns', 'tls'].map(requireBuiltin);
 const { X509Certificate } = crypto;
-const { pipeline } = req('stream').promises;
-const SELF = path.resolve(process.argv[1]), BASE_DIR = path.dirname(SELF);
+const { pipeline } = requireBuiltin('stream').promises;
+const SCRIPT_PATH = path.resolve(process.argv[1]), BASE_DIR = path.dirname(SCRIPT_PATH);
 loadEnv(path.join(BASE_DIR, '.env'));
 
-const env = (k, d = '') => (process.env[k] ?? d).trim();
-const mode = (k, d = '') => env(k, d).toLowerCase();
+const getEnv = (key, defaultValue = '') => (process.env[key] ?? defaultValue).trim();
+const getEnvMode = (key, defaultValue = '') => getEnv(key, defaultValue).toLowerCase();
 
 // ========== 用户配置(优先级：环境变量 > 同目录 .env > 默认值) ==========
 const CONFIG = {
-  NAME: env('NAME'),
-  UUID: env('UUID'),
-  CLOUDFLARE_TUNNEL_TOKEN: env('CLOUDFLARE_TUNNEL_TOKEN'),
-  CLOUDFLARE_IP: env('CLOUDFLARE_IP', 'www.gov.tw'),
-  PORT: env('PORT'),
-  CERT_HOST: env('CERT_HOST'),
-  VLESS_MODE: mode('VLESS_MODE', 'trojan'),
-  VMESS_MODE: mode('VMESS_MODE'),
-  TROJAN_MODE: mode('TROJAN_MODE', 'vmess'),
-  SHADOWSOCKS_MODE: mode('SHADOWSOCKS_MODE'),
-  HYSTERIA2_MODE: env('HYSTERIA2_MODE'),
-  MIXED_MODE: env('MIXED_MODE'),
-  WIREGUARD_MODE: env('WIREGUARD_MODE'),
-  WORK_DIR: env('WORK_DIR'),
-  KOMARI_ENDPOINT: env('KOMARI_ENDPOINT'),
-  KOMARI_TOKEN: env('KOMARI_TOKEN'),
-  LOG_LEVEL: mode('LOG_LEVEL', 'warning'),
+  NAME: getEnv('NAME'),
+  UUID: getEnv('UUID'),
+  CLOUDFLARE_TUNNEL_TOKEN: getEnv('CLOUDFLARE_TUNNEL_TOKEN'),
+  CLOUDFLARE_IP: getEnv('CLOUDFLARE_IP', 'www.gov.tw'),
+  PORT: getEnv('PORT'),
+  CERT_HOST: getEnv('CERT_HOST'),
+  VLESS_MODE: getEnvMode('VLESS_MODE', 'trojan'),
+  VMESS_MODE: getEnvMode('VMESS_MODE'),
+  TROJAN_MODE: getEnvMode('TROJAN_MODE', 'vmess'),
+  SHADOWSOCKS_MODE: getEnvMode('SHADOWSOCKS_MODE'),
+  HYSTERIA2_MODE: getEnv('HYSTERIA2_MODE'),
+  MIXED_MODE: getEnv('MIXED_MODE'),
+  WIREGUARD_MODE: getEnv('WIREGUARD_MODE'),
+  WORK_DIR: getEnv('WORK_DIR'),
+  KOMARI_ENDPOINT: getEnv('KOMARI_ENDPOINT'),
+  KOMARI_TOKEN: getEnv('KOMARI_TOKEN'),
+  LOG_LEVEL: getEnvMode('LOG_LEVEL', 'warning'),
 };
 normalizeConfig();
 if (CONFIG.LOG_LEVEL !== 'none') persistEnv(path.join(BASE_DIR, '.env'));
@@ -40,15 +40,15 @@ const QUIET = LOG_LEVEL === 'none';
 if (QUIET) console.log = console.error = () => {};
 const STDIO = QUIET ? 'ignore' : 'inherit';
 const uuidHash = crypto.createHash('sha256').update(UUID).digest('hex');
-const h4 = uuidHash.slice(0, 4);
+const uuidHashPrefix = uuidHash.slice(0, 4);
 const ARCH = { x64: 'amd64', arm64: 'arm64' }[process.arch];
 
-console.log('[ENV]', Object.entries(CONFIG).filter(([, v]) => v).map(([k, v]) => `${k}=${/UUID|TOKEN/.test(k) ? `${v.slice(0, 4)}***` : v}`).join(' '));
+console.log('[ENV]', Object.entries(CONFIG).filter(([, value]) => value).map(([key, value]) => `${key}=${/UUID|TOKEN/.test(key) ? `${value.slice(0, 4)}***` : value}`).join(' '));
 
 let WORK_DIR = '';
-for (const dir of [...(CONFIG.WORK_DIR ? [path.resolve(BASE_DIR, CONFIG.WORK_DIR)] : []), `/var/lib/.cache${h4}`, `/tmp/.cache${h4}`]) {
+for (const dir of [...(CONFIG.WORK_DIR ? [path.resolve(BASE_DIR, CONFIG.WORK_DIR)] : []), `/var/lib/.cache${uuidHashPrefix}`, `/tmp/.cache${uuidHashPrefix}`]) {
   try { fs.mkdirSync(dir, { recursive: true }); fs.accessSync(dir, fs.constants.R_OK | fs.constants.W_OK); WORK_DIR = dir; break; }
-  catch (e) { console.error(`[DIR] Cannot access ${dir}: ${e.message}`); }
+  catch (error) { console.error(`[DIR] Cannot access ${dir}: ${error.message}`); }
 }
 if (!WORK_DIR) process.exit(1);
 console.log(`[DIR] Work directory: ${WORK_DIR}`);
@@ -56,15 +56,15 @@ process.chdir(WORK_DIR);
 if (!ARCH) die(`[ARCH] Unsupported architecture: ${process.arch}`);
 
 // ========== 通用函数 ==========
-function die(msg) { console.error(msg); process.exit(1); }
-function readLog(file) { try { return fs.readFileSync(file, 'utf8'); } catch { return ''; } }
-function loadEnv(file) {
-  try { return process.loadEnvFile(file); } catch (e) { if (e.code === 'ENOENT') return; }
-  for (const line of readLog(file).split(/\r?\n/)) {
-    const m = line.match(/^\s*(?:export\s+)?([A-Za-z_]\w*)\s*=\s*(.*)$/);
-    if (!m || line.trim().startsWith('#')) continue;
-    const raw = m[2].trim(), q = raw.match(/^(['"])(.*?)\1/);
-    if (process.env[m[1]] === undefined) process.env[m[1]] = q ? q[2] : raw.replace(/\s+#.*$/, '');
+function die(message) { console.error(message); process.exit(1); }
+function readLog(filePath) { try { return fs.readFileSync(filePath, 'utf8'); } catch { return ''; } }
+function loadEnv(filePath) {
+  try { return process.loadEnvFile(filePath); } catch (error) { if (error.code === 'ENOENT') return; }
+  for (const line of readLog(filePath).split(/\r?\n/)) {
+    const match = line.match(/^\s*(?:export\s+)?([A-Za-z_]\w*)\s*=\s*(.*)$/);
+    if (!match || line.trim().startsWith('#')) continue;
+    const rawValue = match[2].trim(), quoted = rawValue.match(/^(['"])(.*?)\1/);
+    if (process.env[match[1]] === undefined) process.env[match[1]] = quoted ? quoted[2] : rawValue.replace(/\s+#.*$/, '');
   }
 }
 function normalizeConfig() {
@@ -73,123 +73,133 @@ function normalizeConfig() {
   CONFIG.CERT_HOST = CONFIG.CERT_HOST.replace(/^[a-z]+:\/\//i, '').replace(/[/:].*$/, '');
 }
 // 把配置持久化到 .env(权限 600)，并把脚本中的 CONFIG 改为只读环境变量
-function persistEnv(file) {
-  const q = (k, v) => `${k}=${/[\s#'"]/.test(v) ? `"${v}"` : v}`;
-  let text = readLog(file);
-  for (const [k, v] of Object.entries(CONFIG)) {
-    const re = new RegExp(`^\\s*(?:export\\s+)?${k}\\s*=.*$`, 'm');
-    text = re.test(text) ? text.replace(re, () => q(k, v)) : `${text}${text && !text.endsWith('\n') ? '\n' : ''}${q(k, v)}\n`;
+function persistEnv(filePath) {
+  const formatEnvLine = (key, value) => `${key}=${/[\s#'"]/.test(value) ? `"${value}"` : value}`;
+  let fileText = readLog(filePath);
+  for (const [key, value] of Object.entries(CONFIG)) {
+    const keyPattern = new RegExp(`^\\s*(?:export\\s+)?${key}\\s*=.*$`, 'm');
+    fileText = keyPattern.test(fileText)
+      ? fileText.replace(keyPattern, () => formatEnvLine(key, value))
+      : `${fileText}${fileText && !fileText.endsWith('\n') ? '\n' : ''}${formatEnvLine(key, value)}\n`;
   }
-  try { fs.writeFileSync(file, text, { mode: 0o600 }); fs.chmodSync(file, 0o600); } catch (e) { console.error(`[ENV] Cannot write ${file}: ${e.message}`); }
+  try { fs.writeFileSync(filePath, fileText, { mode: 0o600 }); fs.chmodSync(filePath, 0o600); }
+  catch (error) { console.error(`[ENV] Cannot write ${filePath}: ${error.message}`); }
   rewriteConfigToEnvReads();
 }
 function rewriteConfigToEnvReads() {
   try {
-    const src = fs.readFileSync(SELF, 'utf8');
-    const block = src.match(/^const CONFIG = \{\n[\s\S]*?\n\};/m);
-    if (!block) return console.error('[ENV] CONFIG block not found, script not rewritten');
-    const out = block[0].replace(/^  ([A-Z0-9_]+): .*$/gm, (l, k) => (k in CONFIG ? `  ${k}: ${/_MODE$|^LOG_LEVEL$/.test(k) ? 'mode' : 'env'}('${k}'),` : l));
-    fs.writeFileSync(SELF, src.replace(block[0], () => out));
-  } catch (e) { console.error(`[ENV] Cannot rewrite script: ${e.message}`); }
+    const scriptSource = fs.readFileSync(SCRIPT_PATH, 'utf8');
+    const configBlock = scriptSource.match(/^const CONFIG = \{\n[\s\S]*?\n\};/m);
+    if (!configBlock) return console.error('[ENV] CONFIG block not found, script not rewritten');
+    const rewrittenBlock = configBlock[0].replace(/^  ([A-Z0-9_]+): .*$/gm, (line, key) => (key in CONFIG
+      ? `  ${key}: ${/_MODE$|^LOG_LEVEL$/.test(key) ? 'getEnvMode' : 'getEnv'}('${key}'),`
+      : line));
+    fs.writeFileSync(SCRIPT_PATH, scriptSource.replace(configBlock[0], () => rewrittenBlock));
+  } catch (error) { console.error(`[ENV] Cannot rewrite script: ${error.message}`); }
 }
 
-const toB64 = (d) => Buffer.from(d).toString('base64');
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-const validPort = (v) => /^\d+$/.test(v) && +v >= 1 && +v <= 65535;
-const nonEmpty = (f) => { try { return fs.statSync(f).size > 0; } catch { return false; } };
-const urlEncode = (t) => encodeURIComponent(t).replace(/[!'()*]/g, (c) => `%${c.charCodeAt(0).toString(16).toUpperCase()}`);
+const toBase64 = (data) => Buffer.from(data).toString('base64');
+const sleep = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds));
+const validPort = (value) => /^\d+$/.test(value) && +value >= 1 && +value <= 65535;
+const nonEmpty = (filePath) => { try { return fs.statSync(filePath).size > 0; } catch { return false; } };
+const urlEncode = (text) => encodeURIComponent(text).replace(/[!'()*]/g, (char) => `%${char.charCodeAt(0).toString(16).toUpperCase()}`);
 
-// HTTPS 请求：跟随重定向；传 file 则写入文件，否则返回 { status, body }
-function request(url, { family, timeout = 10000, file, redirects = 5 } = {}) {
+// HTTPS 请求：跟随重定向；传 outputFile 则写入文件，否则返回 { status, body }
+function request(url, { family, timeout = 10000, outputFile, redirects = 5 } = {}) {
   return new Promise((resolve, reject) => {
-    const r = https.get(url, { family }, (res) => {
-      const { statusCode: status, headers } = res;
-      if ([301, 302, 303, 307, 308].includes(status) && headers.location) {
-        res.resume();
+    const httpRequest = https.get(url, { family }, (response) => {
+      const { statusCode, headers } = response;
+      if ([301, 302, 303, 307, 308].includes(statusCode) && headers.location) {
+        response.resume();
         return redirects <= 0 ? reject(new Error('too many redirects'))
-          : request(new URL(headers.location, url).href, { family, timeout, file, redirects: redirects - 1 }).then(resolve, reject);
+          : request(new URL(headers.location, url).href, { family, timeout, outputFile, redirects: redirects - 1 }).then(resolve, reject);
       }
-      if (file) {
-        if (status >= 400) { res.resume(); return reject(new Error(`HTTP ${status}`)); }
-        return res.pipe(fs.createWriteStream(file).on('finish', () => resolve({ status })).on('error', reject));
+      if (outputFile) {
+        if (statusCode >= 400) { response.resume(); return reject(new Error(`HTTP ${statusCode}`)); }
+        return response.pipe(fs.createWriteStream(outputFile).on('finish', () => resolve({ status: statusCode })).on('error', reject));
       }
       const chunks = [];
-      res.on('data', (c) => chunks.push(c)).on('end', () => resolve({ status, body: Buffer.concat(chunks).toString() })).on('error', reject);
+      response.on('data', (chunk) => chunks.push(chunk))
+        .on('end', () => resolve({ status: statusCode, body: Buffer.concat(chunks).toString() }))
+        .on('error', reject);
     });
-    r.setTimeout(timeout, () => r.destroy(new Error('timeout')));
-    r.on('error', reject);
+    httpRequest.setTimeout(timeout, () => httpRequest.destroy(new Error('timeout')));
+    httpRequest.on('error', reject);
   });
 }
 
 // 先写 .part 再改名，失败重试 3 次
-async function download(dest, url) {
-  let err;
-  for (let i = 0; i < 3; i++) {
-    try { await request(url, { file: `${dest}.part` }); fs.renameSync(`${dest}.part`, dest); return true; }
-    catch (e) { err = e; fs.rmSync(`${dest}.part`, { force: true }); await sleep(1000); }
+async function download(destPath, url) {
+  let lastError;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try { await request(url, { outputFile: `${destPath}.part` }); fs.renameSync(`${destPath}.part`, destPath); return true; }
+    catch (error) { lastError = error; fs.rmSync(`${destPath}.part`, { force: true }); await sleep(1000); }
   }
-  console.error(`[DL] Download failed: ${url} (${err?.code ?? ''} ${err?.message ?? 'unknown error'})`);
+  console.error(`[DL] Download failed: ${url} (${lastError?.code ?? ''} ${lastError?.message ?? 'unknown error'})`);
   return false;
 }
 
 // 流式解压 zip：只读中央目录，逐文件解压
-async function unzip(zipFile, dir) {
-  const root = path.resolve(dir), fd = fs.openSync(zipFile, 'r'), size = fs.fstatSync(fd).size;
-  const readAt = (len, pos) => { const b = Buffer.alloc(len); fs.readSync(fd, b, 0, len, pos); return b; };
+async function unzip(zipPath, targetDir) {
+  const rootDir = path.resolve(targetDir), zipFd = fs.openSync(zipPath, 'r'), zipSize = fs.fstatSync(zipFd).size;
+  const readAt = (length, position) => { const buffer = Buffer.alloc(length); fs.readSync(zipFd, buffer, 0, length, position); return buffer; };
   try {
-    const tail = readAt(Math.min(size, 65557), Math.max(0, size - 65557));
-    let end = tail.length - 22;
-    while (end >= 0 && tail.readUInt32LE(end) !== 0x06054b50) end--;
-    if (end < 0) throw new Error('not a zip file');
-    const central = readAt(tail.readUInt32LE(end + 12), tail.readUInt32LE(end + 16));
-    for (let i = 0, c = 0; i < tail.readUInt16LE(end + 10); i++) {
-      const method = central.readUInt16LE(c + 10), csize = central.readUInt32LE(c + 20);
-      const nameLen = central.readUInt16LE(c + 28), offset = central.readUInt32LE(c + 42);
-      const name = central.toString('utf8', c + 46, c + 46 + nameLen);
-      c += 46 + nameLen + central.readUInt16LE(c + 30) + central.readUInt16LE(c + 32);
-      const entry = path.resolve(root, name);
-      if (name.endsWith('/') || !entry.startsWith(root + path.sep)) continue;
-      fs.mkdirSync(path.dirname(entry), { recursive: true });
-      if (!csize) { fs.writeFileSync(entry, ''); continue; }
-      const local = readAt(30, offset), start = offset + 30 + local.readUInt16LE(26) + local.readUInt16LE(28);
-      await pipeline(fs.createReadStream(zipFile, { start, end: start + csize - 1 }),
-        ...(method === 0 ? [] : [zlib.createInflateRaw()]), fs.createWriteStream(entry));
+    const tail = readAt(Math.min(zipSize, 65557), Math.max(0, zipSize - 65557));
+    let eocdOffset = tail.length - 22;
+    while (eocdOffset >= 0 && tail.readUInt32LE(eocdOffset) !== 0x06054b50) eocdOffset--;
+    if (eocdOffset < 0) throw new Error('not a zip file');
+    const centralDirectory = readAt(tail.readUInt32LE(eocdOffset + 12), tail.readUInt32LE(eocdOffset + 16));
+    for (let entryIndex = 0, cursor = 0; entryIndex < tail.readUInt16LE(eocdOffset + 10); entryIndex++) {
+      const method = centralDirectory.readUInt16LE(cursor + 10), compressedSize = centralDirectory.readUInt32LE(cursor + 20);
+      const nameLength = centralDirectory.readUInt16LE(cursor + 28), localHeaderOffset = centralDirectory.readUInt32LE(cursor + 42);
+      const entryName = centralDirectory.toString('utf8', cursor + 46, cursor + 46 + nameLength);
+      cursor += 46 + nameLength + centralDirectory.readUInt16LE(cursor + 30) + centralDirectory.readUInt16LE(cursor + 32);
+      const entryPath = path.resolve(rootDir, entryName);
+      if (entryName.endsWith('/') || !entryPath.startsWith(rootDir + path.sep)) continue;
+      fs.mkdirSync(path.dirname(entryPath), { recursive: true });
+      if (!compressedSize) { fs.writeFileSync(entryPath, ''); continue; }
+      const localHeader = readAt(30, localHeaderOffset);
+      const dataStart = localHeaderOffset + 30 + localHeader.readUInt16LE(26) + localHeader.readUInt16LE(28);
+      await pipeline(fs.createReadStream(zipPath, { start: dataStart, end: dataStart + compressedSize - 1 }),
+        ...(method === 0 ? [] : [zlib.createInflateRaw()]), fs.createWriteStream(entryPath));
     }
-  } finally { fs.closeSync(fd); }
+  } finally { fs.closeSync(zipFd); }
 }
 
 // Go 程序内存参数：GOGC 调低；有容器内存限制时设 GOMEMLIMIT
 const GO_ENV = (() => {
-  const lim = +(readLog('/sys/fs/cgroup/memory.max').trim() || readLog('/sys/fs/cgroup/memory/memory.limit_in_bytes').trim());
-  return { GOGC: '50', ...(lim > 0 && lim < 2 ** 40 ? { GOMEMLIMIT: `${Math.floor(lim * 0.6 / 1048576)}MiB` } : {}) };
+  const memoryLimit = +(readLog('/sys/fs/cgroup/memory.max').trim() || readLog('/sys/fs/cgroup/memory/memory.limit_in_bytes').trim());
+  return { GOGC: '50', ...(memoryLimit > 0 && memoryLimit < 2 ** 40 ? { GOMEMLIMIT: `${Math.floor(memoryLimit * 0.6 / 1048576)}MiB` } : {}) };
 })();
 
-const children = [];
-process.on('exit', () => children.forEach((c) => { try { c.kill(); } catch {} }));
-for (const sig of ['SIGINT', 'SIGTERM']) process.on(sig, () => process.exit(0));
+const childProcesses = [];
+process.on('exit', () => childProcesses.forEach((child) => { try { child.kill(); } catch {} }));
+for (const signal of ['SIGINT', 'SIGTERM']) process.on(signal, () => process.exit(0));
 
-async function killPrevious(name, tag) {
-  try { cp.execFileSync('pkill', ['-x', name], { stdio: 'ignore' }); } catch { return; }
-  console.log(`[${tag}] Stopped previous ${name}`);
+async function killPrevious(processName, logTag) {
+  try { childProcess.execFileSync('pkill', ['-x', processName], { stdio: 'ignore' }); } catch { return; }
+  console.log(`[${logTag}] Stopped previous ${processName}`);
   await sleep(1000);
 }
 
-function spawnBackground(bin, args, logFile, extraEnv = {}) {
-  const fd = fs.openSync(logFile, 'w');
-  const child = cp.spawn(bin, args, { env: { ...process.env, ...GO_ENV, ...extraEnv }, stdio: ['ignore', fd, fd] });
-  fs.closeSync(fd);
-  children.push(child);
+function spawnBackground(binPath, args, logFile, extraEnv = {}) {
+  const logFd = fs.openSync(logFile, 'w');
+  const child = childProcess.spawn(binPath, args, { env: { ...process.env, ...GO_ENV, ...extraEnv }, stdio: ['ignore', logFd, logFd] });
+  fs.closeSync(logFd);
+  childProcesses.push(child);
   return child;
 }
 
 // ========== 协议与模式 ==========
 const PROTOCOLS = ['vless', 'vmess', 'trojan', 'shadowsocks'];
-const WS_PATH = Object.fromEntries(PROTOCOLS.map((p) => [p, `/${UUID}-${p === 'shadowsocks' ? 'ss' : p}`]));
+const WS_PATH = Object.fromEntries(PROTOCOLS.map((protocol) => [protocol, `/${UUID}-${protocol === 'shadowsocks' ? 'ss' : protocol}`]));
 const SS_PORT = 40004, SS_WS_PORT = 40005;
 const abstractSocket = (name) => `@xray-${crypto.createHash('sha1').update(BASE_DIR).digest('hex').slice(0, 8)}-${name}`;
-const endpointOf = (p, name, ssPort) => (p === 'shadowsocks' ? { listen: '127.0.0.1', port: ssPort, dest: ssPort } : { listen: abstractSocket(name), dest: abstractSocket(name) });
-const internalEndpoint = (p) => endpointOf(p, p, SS_PORT);
-const wsInternalEndpoint = (p) => endpointOf(p, `${p}-ws`, SS_WS_PORT);
+const endpointOf = (protocol, name, ssPort) => (protocol === 'shadowsocks'
+  ? { listen: '127.0.0.1', port: ssPort, dest: ssPort }
+  : { listen: abstractSocket(name), dest: abstractSocket(name) });
+const internalEndpoint = (protocol) => endpointOf(protocol, protocol, SS_PORT);
+const wsInternalEndpoint = (protocol) => endpointOf(protocol, `${protocol}-ws`, SS_WS_PORT);
 const FRONT_SOCKET = abstractSocket('front'), WEB_SOCKET = abstractSocket('web');
 const DEFAULT_FRONT_PORT = 8000, WG_CLIENT_ADDR = '10.0.0.2/32';
 const MODES = { vless: VLESS_MODE, vmess: VMESS_MODE, trojan: TROJAN_MODE, shadowsocks: SHADOWSOCKS_MODE };
@@ -208,11 +218,11 @@ if (PORT && CERT_HOST) {
   console.log(`[WEB] Other paths on the front port are forwarded to ${WEB_DESTINATION}`);
 }
 
-const modePort = (name, v, desc) => {
-  if (!v) return 0;
-  if (!validPort(v)) die(`[MODE] ${name}='${v}' is invalid (expected a port 1-65535, or empty to disable)`);
-  console.log(`[MODE] port ${+v}/${desc}`);
-  return +v;
+const modePort = (envName, value, description) => {
+  if (!value) return 0;
+  if (!validPort(value)) die(`[MODE] ${envName}='${value}' is invalid (expected a port 1-65535, or empty to disable)`);
+  console.log(`[MODE] port ${+value}/${description}`);
+  return +value;
 };
 const HYSTERIA2_PORT = modePort('HYSTERIA2_MODE', HYSTERIA2_MODE, 'udp: hysteria2');
 const MIXED_PORT = modePort('MIXED_MODE', MIXED_MODE, 'tcp: mixed (socks5 + http)');
@@ -221,27 +231,27 @@ const WIREGUARD_PORT = modePort('WIREGUARD_MODE', WIREGUARD_MODE, 'udp: wireguar
 // 1. 解析各协议的 *_MODE
 function parseModes() {
   for (const protocol of PROTOCOLS) {
-    const v = `${protocol.toUpperCase()}_MODE`;
+    const envName = `${protocol.toUpperCase()}_MODE`;
     let hasReality = false;
-    for (const token of (MODES[protocol] || '').split(',').map((s) => s.trim()).filter(Boolean)) {
+    for (const token of (MODES[protocol] || '').split(',').map((segment) => segment.trim()).filter(Boolean)) {
       if (token === 'ws' || token === 'cloudflare') {
-        const list = token === 'ws' ? WS_PROTOCOLS : CF_PROTOCOLS;
-        if (list.includes(protocol)) die(`[MODE] ${v}: '${token}' is given more than once`);
-        list.push(protocol);
+        const protocolList = token === 'ws' ? WS_PROTOCOLS : CF_PROTOCOLS;
+        if (protocolList.includes(protocol)) die(`[MODE] ${envName}: '${token}' is given more than once`);
+        protocolList.push(protocol);
         if (token === 'ws') HAS_WS = true; else HAS_CF = true;
         continue;
       }
-      if (hasReality) die(`[MODE] ${v}: only one Reality entry (a port or a fallback protocol) is allowed`);
+      if (hasReality) die(`[MODE] ${envName}: only one Reality entry (a port or a fallback protocol) is allowed`);
       hasReality = true;
       if (/^\d+$/.test(token)) {
-        if (!validPort(token)) die(`[MODE] ${v}='${token}': port must be 1-65535`);
+        if (!validPort(token)) die(`[MODE] ${envName}='${token}': port must be 1-65535`);
         NUMERIC_PORT[protocol] = +token;
       } else if (/^[a-z]+$/.test(token)) {
-        if (!PROTOCOLS.includes(token)) die(`[MODE] ${v}='${token}' is not valid`);
-        if (token === protocol) die(`[MODE] ${v}='${token}': a protocol cannot fall back to itself`);
-        if (!['vless', 'trojan'].includes(protocol)) die(`[MODE] ${v}='${token}': only VLESS and TROJAN can choose a fallback`);
+        if (!PROTOCOLS.includes(token)) die(`[MODE] ${envName}='${token}' is not valid`);
+        if (token === protocol) die(`[MODE] ${envName}='${token}': a protocol cannot fall back to itself`);
+        if (!['vless', 'trojan'].includes(protocol)) die(`[MODE] ${envName}='${token}': only VLESS and TROJAN can choose a fallback`);
         FALLBACK[protocol] = token;
-      } else die(`[MODE] ${v}='${token}' is invalid`);
+      } else die(`[MODE] ${envName}='${token}' is invalid`);
     }
   }
   QUICK_TUNNEL = HAS_CF && CLOUDFLARE_TUNNEL_TOKEN === 'try';
@@ -251,31 +261,33 @@ function parseModes() {
 function buildChains() {
   for (let changed = true; changed;) {
     changed = false;
-    for (const [p, t] of Object.entries(FALLBACK)) {
-      if (NUMERIC_PORT[t] || FALLBACK[t]) continue;
-      console.log(`[MODE] ${p.toUpperCase()}_MODE='${t}': ${t.toUpperCase()} has no Reality port, so this fallback entry is ignored`);
-      delete FALLBACK[p];
+    for (const [protocol, target] of Object.entries(FALLBACK)) {
+      if (NUMERIC_PORT[target] || FALLBACK[target]) continue;
+      console.log(`[MODE] ${protocol.toUpperCase()}_MODE='${target}': ${target.toUpperCase()} has no Reality port, so this fallback entry is ignored`);
+      delete FALLBACK[protocol];
       changed = true;
     }
   }
-  for (const [p, t] of Object.entries(FALLBACK)) {
-    if (FALLBACK_PARENT[t]) die(`[MODE] ${t.toUpperCase()} is the fallback of both ${FALLBACK_PARENT[t].toUpperCase()} and ${p.toUpperCase()}, it can only have one`);
-    FALLBACK_PARENT[t] = p;
+  for (const [protocol, target] of Object.entries(FALLBACK)) {
+    if (FALLBACK_PARENT[target]) die(`[MODE] ${target.toUpperCase()} is the fallback of both ${FALLBACK_PARENT[target].toUpperCase()} and ${protocol.toUpperCase()}, it can only have one`);
+    FALLBACK_PARENT[target] = protocol;
   }
-  for (const p of PROTOCOLS) {
-    const hasReality = !!(NUMERIC_PORT[p] || FALLBACK[p]);
-    if (FRONT_PROTOCOLS().includes(p) || hasReality || FALLBACK_PARENT[p]) ENABLED.push(p);
-    if (hasReality && !FALLBACK_PARENT[p]) CHAIN_HEADS.push(p);
+  for (const protocol of PROTOCOLS) {
+    const hasReality = !!(NUMERIC_PORT[protocol] || FALLBACK[protocol]);
+    if (FRONT_PROTOCOLS().includes(protocol) || hasReality || FALLBACK_PARENT[protocol]) ENABLED.push(protocol);
+    if (hasReality && !FALLBACK_PARENT[protocol]) CHAIN_HEADS.push(protocol);
   }
   for (const head of CHAIN_HEADS) {
     let tail = head;
     CHAIN[head] = [head];
     while (FALLBACK[tail]) { tail = FALLBACK[tail]; CHAIN[head].push(tail); }
     HEAD_PORT[head] = NUMERIC_PORT[tail];
-    for (const p of CHAIN[head]) REALITY_PORT[p] = HEAD_PORT[head];
+    for (const protocol of CHAIN[head]) REALITY_PORT[protocol] = HEAD_PORT[head];
   }
   XRAY_ON = ENABLED.length > 0 || !!(HYSTERIA2_PORT || MIXED_PORT || WIREGUARD_PORT);
-  for (const p of ENABLED) if ((NUMERIC_PORT[p] || FALLBACK[p] || FALLBACK_PARENT[p]) && !REALITY_PORT[p]) die(`[MODE] ${p.toUpperCase()} is part of a fallback loop`);
+  for (const protocol of ENABLED) {
+    if ((NUMERIC_PORT[protocol] || FALLBACK[protocol] || FALLBACK_PARENT[protocol]) && !REALITY_PORT[protocol]) die(`[MODE] ${protocol.toUpperCase()} is part of a fallback loop`);
+  }
 }
 
 // 3. 前置入口规划
@@ -285,20 +297,20 @@ function planFront() {
   if (WS_FRONT_ON) {
     if (PORT && !validPort(PORT)) die(`[MODE] PORT='${PORT}' is not a valid port`);
     FRONT_PORT = +(PORT || DEFAULT_FRONT_PORT);
-    if (PORT && CHAIN_HEADS.some((h) => HEAD_PORT[h] === FRONT_PORT)) SHARE_FRONT = true;
+    if (PORT && CHAIN_HEADS.some((head) => HEAD_PORT[head] === FRONT_PORT)) SHARE_FRONT = true;
   }
 }
 
 // 4. 端口检查
 function checkPorts() {
-  const ports = CHAIN_HEADS.map((h) => HEAD_PORT[h]);
-  if (WS_FRONT_ON && !SHARE_FRONT) ports.push(FRONT_PORT);
-  if (CF_FRONT_ON && CF_PORT) ports.push(CF_PORT);
-  if (MIXED_PORT) ports.push(MIXED_PORT);
-  const dup = ports.find((p, i) => ports.indexOf(p) !== i);
-  if (dup !== undefined) die(`[MODE] Port ${dup} is used more than once`);
-  const bad = ports.find((p) => p === SS_PORT || p === SS_WS_PORT);
-  if (bad !== undefined) die(`[MODE] Port ${bad} conflicts with the internal ports 40004 / 40005 used by Shadowsocks`);
+  const usedPorts = CHAIN_HEADS.map((head) => HEAD_PORT[head]);
+  if (WS_FRONT_ON && !SHARE_FRONT) usedPorts.push(FRONT_PORT);
+  if (CF_FRONT_ON && CF_PORT) usedPorts.push(CF_PORT);
+  if (MIXED_PORT) usedPorts.push(MIXED_PORT);
+  const duplicatePort = usedPorts.find((port, index) => usedPorts.indexOf(port) !== index);
+  if (duplicatePort !== undefined) die(`[MODE] Port ${duplicatePort} is used more than once`);
+  const conflictingPort = usedPorts.find((port) => port === SS_PORT || port === SS_WS_PORT);
+  if (conflictingPort !== undefined) die(`[MODE] Port ${conflictingPort} conflicts with the internal ports 40004 / 40005 used by Shadowsocks`);
 }
 
 // ========== TLS 证书 ==========
@@ -306,45 +318,47 @@ const IPV4 = /^\d{1,3}(\.\d{1,3}){3}$/;
 let CERT_FILE = '', KEY_FILE = '', TLS_SERVER_NAME = '', TLS_INSECURE = true, TLS_PINNED_CERT_SHA256 = '';
 
 // 自签证书(RSA 2048，10 年)；已有且 30 天内不过期则复用
-function generateSelfSignedCert(cn) {
-  const dir = path.join(WORK_DIR, '.selfsigned');
-  fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
-  CERT_FILE = path.join(dir, `${cn}.crt`); KEY_FILE = path.join(dir, `${cn}.key`);
+function generateSelfSignedCert(commonName) {
+  const certDir = path.join(WORK_DIR, '.selfsigned');
+  fs.mkdirSync(certDir, { recursive: true, mode: 0o700 });
+  CERT_FILE = path.join(certDir, `${commonName}.crt`);
+  KEY_FILE = path.join(certDir, `${commonName}.key`);
   if (nonEmpty(CERT_FILE) && nonEmpty(KEY_FILE)) {
     try { if (Date.parse(new X509Certificate(fs.readFileSync(CERT_FILE)).validTo) - Date.now() > 30 * 86400e3) return; } catch {}
   }
-  cp.execFileSync('openssl', ['req', '-x509', '-newkey', 'rsa:2048', '-nodes', '-days', '3650',
-    '-keyout', KEY_FILE, '-out', CERT_FILE, '-subj', `/CN=${cn}`, '-addext', `subjectAltName=DNS:${cn},DNS:localhost`], { stdio: 'ignore' });
+  childProcess.execFileSync('openssl', ['req', '-x509', '-newkey', 'rsa:2048', '-nodes', '-days', '3650',
+    '-keyout', KEY_FILE, '-out', CERT_FILE, '-subj', `/CN=${commonName}`, '-addext', `subjectAltName=DNS:${commonName},DNS:localhost`], { stdio: 'ignore' });
   fs.chmodSync(KEY_FILE, 0o600);
 }
 
 // 校验证书链：域名匹配、逐级验签、最终落在系统信任根上；返回空串表示可信
-function verifyChain(certs, host) {
-  if (!certs[0].checkHost(host)) return 'hostname mismatch';
-  const roots = (tls.getCACertificates ? tls.getCACertificates('default') : tls.rootCertificates).map((p) => new X509Certificate(p));
+function verifyChain(certChain, hostname) {
+  if (!certChain[0].checkHost(hostname)) return 'hostname mismatch';
+  const trustedRoots = (tls.getCACertificates ? tls.getCACertificates('default') : tls.rootCertificates).map((pem) => new X509Certificate(pem));
   const now = Date.now();
-  const valid = (c) => now >= Date.parse(c.validFrom) && now <= Date.parse(c.validTo);
-  const signedBy = (c, i) => c.checkIssued(i) && c.verify(i.publicKey);
-  let cur = certs[0];
+  const isValidNow = (cert) => now >= Date.parse(cert.validFrom) && now <= Date.parse(cert.validTo);
+  const isSignedBy = (cert, issuer) => cert.checkIssued(issuer) && cert.verify(issuer.publicKey);
+  let current = certChain[0];
   for (let depth = 0; depth < 8; depth++) {
-    if (!valid(cur)) return 'certificate expired or not yet valid';
-    if (roots.some((r) => r.fingerprint256 === cur.fingerprint256 || (valid(r) && signedBy(cur, r)))) return '';
-    cur = certs.slice(1).find((i) => i !== cur && i.ca && signedBy(cur, i));
-    if (!cur) return 'issuer is not trusted';
+    if (!isValidNow(current)) return 'certificate expired or not yet valid';
+    if (trustedRoots.some((root) => root.fingerprint256 === current.fingerprint256 || (isValidNow(root) && isSignedBy(current, root)))) return '';
+    current = certChain.slice(1).find((issuer) => issuer !== current && issuer.ca && isSignedBy(current, issuer));
+    if (!current) return 'issuer is not trusted';
   }
   return 'chain too long';
 }
 
-function trustedCertForHost(host) {
-  const certFile = path.join(WORK_DIR, `${host}.crt`), keyFile = path.join(WORK_DIR, `${host}.key`);
+function trustedCertForHost(hostname) {
+  const certFile = path.join(WORK_DIR, `${hostname}.crt`), keyFile = path.join(WORK_DIR, `${hostname}.key`);
   if (!nonEmpty(certFile) || !nonEmpty(keyFile)) return false;
-  let certs;
+  let certChain;
   try {
-    certs = (fs.readFileSync(certFile, 'utf8').match(/-----BEGIN CERTIFICATE-----[\s\S]+?-----END CERTIFICATE-----/g) || []).map((p) => new X509Certificate(p));
-    if (!certs.length || !certs[0].checkPrivateKey(crypto.createPrivateKey(fs.readFileSync(keyFile)))) throw new Error('no matching certificate and key');
-  } catch (e) { console.error(`[TLS] Cannot read ${certFile} / ${keyFile}: ${e.message}`); return false; }
-  const reason = verifyChain(certs, host);
-  if (reason) { console.error(`[TLS] ${certFile} is not trusted for ${host}: ${reason}`); return false; }
+    certChain = (fs.readFileSync(certFile, 'utf8').match(/-----BEGIN CERTIFICATE-----[\s\S]+?-----END CERTIFICATE-----/g) || [])
+      .map((pem) => new X509Certificate(pem));
+    if (!certChain.length || !certChain[0].checkPrivateKey(crypto.createPrivateKey(fs.readFileSync(keyFile)))) throw new Error('no matching certificate and key');
+  } catch (error) { console.error(`[TLS] Cannot read ${certFile} / ${keyFile}: ${error.message}`); return false; }
+  const reason = verifyChain(certChain, hostname);
+  if (reason) { console.error(`[TLS] ${certFile} is not trusted for ${hostname}: ${reason}`); return false; }
   CERT_FILE = certFile; KEY_FILE = keyFile;
   return true;
 }
@@ -362,12 +376,13 @@ function setupTls() {
 
 // ========== 密钥(由 UUID 派生，同一 UUID 永远得到同一组密钥) ==========
 function deriveKey(label, encoding) {
-  const priv = crypto.createHash('sha256').update(`${label}:${UUID}`).digest();
-  priv[0] &= 248; priv[31] = (priv[31] & 127) | 64;
-  const pub = crypto.createPublicKey(crypto.createPrivateKey({
-    key: Buffer.concat([Buffer.from('302e020100300506032b656e04220420', 'hex'), priv]), format: 'der', type: 'pkcs8',
+  const privateKeyBytes = crypto.createHash('sha256').update(`${label}:${UUID}`).digest();
+  privateKeyBytes[0] &= 248;
+  privateKeyBytes[31] = (privateKeyBytes[31] & 127) | 64;
+  const publicKeyBytes = crypto.createPublicKey(crypto.createPrivateKey({
+    key: Buffer.concat([Buffer.from('302e020100300506032b656e04220420', 'hex'), privateKeyBytes]), format: 'der', type: 'pkcs8',
   })).export({ type: 'spki', format: 'der' }).subarray(-32);
-  return [priv.toString(encoding), Buffer.from(pub).toString(encoding)];
+  return [privateKeyBytes.toString(encoding), Buffer.from(publicKeyBytes).toString(encoding)];
 }
 
 // ========== 链接地址 ==========
@@ -377,11 +392,16 @@ const TRACE_URL = 'https://one.one.one.one/cdn-cgi/trace';
 async function resolvePublicAddress() {
   if (IPV4.test(CERT_HOST)) PUBLIC_ADDRESS = CERT_HOST;
   else {
-    const trace = await request(TRACE_URL, { family: 4, timeout: 5000 }).catch(() => null);
-    PUBLIC_ADDRESS = ((trace && trace.body.match(/^ip=(.*)$/m)) || [, ''])[1].trim();
+    const traceResponse = await request(TRACE_URL, { family: 4, timeout: 5000 }).catch(() => null);
+    PUBLIC_ADDRESS = ((traceResponse && traceResponse.body.match(/^ip=(.*)$/m)) || [, ''])[1].trim();
     if (CERT_HOST && PUBLIC_ADDRESS) {
-      const ips = await dns.promises.lookup(CERT_HOST, { family: 4, all: true }).then((l) => l.map((e) => e.address)).catch(() => []);
-      if (ips.includes(PUBLIC_ADDRESS)) { console.log(`[NET] ${CERT_HOST} points to this server, using it instead of the IP`); PUBLIC_ADDRESS = CERT_HOST; }
+      const resolvedIps = await dns.promises.lookup(CERT_HOST, { family: 4, all: true })
+        .then((entries) => entries.map((entry) => entry.address))
+        .catch(() => []);
+      if (resolvedIps.includes(PUBLIC_ADDRESS)) {
+        console.log(`[NET] ${CERT_HOST} points to this server, using it instead of the IP`);
+        PUBLIC_ADDRESS = CERT_HOST;
+      }
     }
   }
   if (!PUBLIC_ADDRESS) console.error('[NET] Cannot determine the public address, links will be invalid (set CERT_HOST)');
@@ -394,36 +414,36 @@ let WG_SERVER_PRIV = '', WG_SERVER_PUB = '', WG_CLIENT_PRIV = '', WG_CLIENT_PUB 
 const SNIFFING = { enabled: true, destOverride: ['http', 'tls', 'quic'], routeOnly: true };
 
 const streamTcp = () => ({ network: 'tcp', security: 'none' });
-const streamWs = (p) => ({ network: 'ws', security: 'none', wsSettings: { path: p } });
-const streamReality = (dest = 'www.iij.ad.jp:443', sni = 'www.iij.ad.jp') => ({
+const streamWs = (wsPath) => ({ network: 'ws', security: 'none', wsSettings: { path: wsPath } });
+const streamReality = (dest = 'www.iij.ad.jp:443', serverName = 'www.iij.ad.jp') => ({
   network: 'tcp', security: 'reality',
-  realitySettings: { show: false, dest, xver: 0, serverNames: [sni], privateKey: REALITY_PRIVATE_KEY, shortIds: [REALITY_SHORT_ID] },
+  realitySettings: { show: false, dest, xver: 0, serverNames: [serverName], privateKey: REALITY_PRIVATE_KEY, shortIds: [REALITY_SHORT_ID] },
 });
 const streamTls = (network, alpn, extra = {}) => ({
   network, security: 'tls',
   tlsSettings: { serverName: TLS_SERVER_NAME, alpn: [alpn], certificates: [{ certificateFile: CERT_FILE, keyFile: KEY_FILE }] },
   ...extra,
 });
-const inbound = (tag, listen, port, protocol, settings, stream) => ({ tag, listen, port, protocol, settings, streamSettings: stream, sniffing: SNIFFING });
+const inbound = (tag, listen, port, protocol, settings, streamSettings) => ({ tag, listen, port, protocol, settings, streamSettings, sniffing: SNIFFING });
 
-function protocolSettings(p, fallbacks, flow) {
-  const fb = fallbacks ? { fallbacks } : {};
-  switch (p) {
-    case 'vless': return { clients: [{ id: UUID, email: UUID, ...(flow ? { flow } : {}) }], decryption: 'none', ...fb };
+function protocolSettings(protocol, fallbacks, flow) {
+  const fallbackConfig = fallbacks ? { fallbacks } : {};
+  switch (protocol) {
+    case 'vless': return { clients: [{ id: UUID, email: UUID, ...(flow ? { flow } : {}) }], decryption: 'none', ...fallbackConfig };
     case 'vmess': return { clients: [{ id: UUID, email: UUID }] };
-    case 'trojan': return { clients: [{ password: UUID, email: UUID }], ...fb };
+    case 'trojan': return { clients: [{ password: UUID, email: UUID }], ...fallbackConfig };
     case 'shadowsocks': return { method: 'aes-256-gcm', password: UUID, network: 'tcp' };
   }
 }
 
 function buildConfig() {
   const inbounds = [];
-  for (const p of FRONT_PROTOCOLS()) {
-    const ep = wsInternalEndpoint(p);
-    inbounds.push(inbound(`${p}-ws-in`, ep.listen, ep.port, p, protocolSettings(p), streamWs(WS_PATH[p])));
+  for (const protocol of FRONT_PROTOCOLS()) {
+    const endpoint = wsInternalEndpoint(protocol);
+    inbounds.push(inbound(`${protocol}-ws-in`, endpoint.listen, endpoint.port, protocol, protocolSettings(protocol), streamWs(WS_PATH[protocol])));
   }
   const frontFallbacks = (protocols) => [
-    ...protocols.map((p) => ({ path: WS_PATH[p], dest: wsInternalEndpoint(p).dest, xver: 0 })),
+    ...protocols.map((protocol) => ({ path: WS_PATH[protocol], dest: wsInternalEndpoint(protocol).dest, xver: 0 })),
     { dest: WEB_SOCKET, xver: 0 },
   ];
   if (WS_FRONT_ON) {
@@ -432,15 +452,18 @@ function buildConfig() {
   }
   if (CF_FRONT_ON) inbounds.push(inbound('cf-front-in', '::', CF_PORT, 'vless', protocolSettings('vless', frontFallbacks(CF_PROTOCOLS)), streamTcp()));
   for (const head of CHAIN_HEADS) {
-    for (const p of CHAIN[head]) {
-      const fallbacks = FALLBACK[p] ? [{ dest: internalEndpoint(FALLBACK[p]).dest, xver: 0 }] : undefined;
-      if (p !== head) {
-        const ep = internalEndpoint(p);
-        inbounds.push(inbound(`${p}-in`, ep.listen, ep.port, p, protocolSettings(p, fallbacks), streamTcp()));
+    for (const protocol of CHAIN[head]) {
+      const fallbacks = FALLBACK[protocol] ? [{ dest: internalEndpoint(FALLBACK[protocol]).dest, xver: 0 }] : undefined;
+      if (protocol !== head) {
+        const endpoint = internalEndpoint(protocol);
+        inbounds.push(inbound(`${protocol}-in`, endpoint.listen, endpoint.port, protocol, protocolSettings(protocol, fallbacks), streamTcp()));
         continue;
       }
-      const stream = SHARE_FRONT && HEAD_PORT[head] === FRONT_PORT ? streamReality(FRONT_SOCKET, TLS_SERVER_NAME) : streamReality();
-      inbounds.push(inbound(`${p}-in`, '::', HEAD_PORT[head], p, protocolSettings(p, fallbacks, p === 'vless' ? VLESS_FLOW : ''), stream));
+      const streamSettings = SHARE_FRONT && HEAD_PORT[head] === FRONT_PORT
+        ? streamReality(FRONT_SOCKET, TLS_SERVER_NAME)
+        : streamReality();
+      inbounds.push(inbound(`${protocol}-in`, '::', HEAD_PORT[head], protocol,
+        protocolSettings(protocol, fallbacks, protocol === 'vless' ? VLESS_FLOW : ''), streamSettings));
     }
   }
   if (HYSTERIA2_PORT) inbounds.push(inbound('hysteria2-in', '::', HYSTERIA2_PORT, 'hysteria', { version: 2, clients: [{ auth: UUID, email: UUID }] }, streamTls('hysteria', 'h3', { hysteriaSettings: { version: 2 } })));
@@ -467,12 +490,14 @@ function buildConfig() {
 // ========== 订阅链接 ==========
 let SS_USERINFO = '', CF_HOSTNAME = '';
 
-function realityLink(p, port, name) {
-  const sni = SHARE_FRONT && port === FRONT_PORT ? TLS_SERVER_NAME : 'www.iij.ad.jp';
-  const prefix = p === 'vless' ? `encryption=none${VLESS_FLOW ? `&flow=${VLESS_FLOW}` : ''}&` : p === 'vmess' ? 'encryption=auto&' : '';
-  const q = `security=reality&sni=${sni}&fp=chrome&pbk=${REALITY_PUBLIC_KEY}&type=tcp&sid=${REALITY_SHORT_ID}`;
-  const userinfo = p === 'shadowsocks' ? SS_USERINFO : UUID;
-  return `${p === 'shadowsocks' ? 'ss' : p}://${userinfo}@${PUBLIC_ADDRESS}:${port}?${prefix}${q}#${urlEncode(name)}`;
+function realityLink(protocol, port, name) {
+  const serverName = SHARE_FRONT && port === FRONT_PORT ? TLS_SERVER_NAME : 'www.iij.ad.jp';
+  const encryptionPrefix = protocol === 'vless'
+    ? `encryption=none${VLESS_FLOW ? `&flow=${VLESS_FLOW}` : ''}&`
+    : protocol === 'vmess' ? 'encryption=auto&' : '';
+  const query = `security=reality&sni=${serverName}&fp=chrome&pbk=${REALITY_PUBLIC_KEY}&type=tcp&sid=${REALITY_SHORT_ID}`;
+  const userinfo = protocol === 'shadowsocks' ? SS_USERINFO : UUID;
+  return `${protocol === 'shadowsocks' ? 'ss' : protocol}://${userinfo}@${PUBLIC_ADDRESS}:${port}?${encryptionPrefix}${query}#${urlEncode(name)}`;
 }
 
 function wsParams(mode) {
@@ -485,116 +510,129 @@ function wsParams(mode) {
   };
 }
 
-function wsLink(p, w, name) {
-  const wsPath = WS_PATH[p], encName = urlEncode(name);
-  const q = `sni=${w.host}&fp=chrome&type=ws&host=${w.host}&path=${wsPath.replace(/\//g, '%2F')}${w.query}#${encName}`;
-  switch (p) {
-    case 'vless': return `vless://${UUID}@${w.address}:${w.port}?encryption=none&security=tls&${q}`;
-    case 'trojan': return `trojan://${UUID}@${w.address}:${w.port}?security=tls&${q}`;
-    case 'vmess': return `vmess://${toB64(JSON.stringify({
-      v: '2', ps: name, add: w.address, port: String(w.port), id: UUID, aid: '0', scy: 'none', net: 'ws', type: 'none',
-      host: w.host, path: wsPath + (w.mode === 'cloudflare' ? '?ed=2560' : ''), tls: 'tls', sni: w.host, alpn: '', fp: '',
-      insecure: String(w.insecure), ...(w.extra || {}), vcn: '', pcs: w.pinned,
+function wsLink(protocol, params, name) {
+  const wsPath = WS_PATH[protocol], encodedName = urlEncode(name);
+  const query = `sni=${params.host}&fp=chrome&type=ws&host=${params.host}&path=${wsPath.replace(/\//g, '%2F')}${params.query}#${encodedName}`;
+  switch (protocol) {
+    case 'vless': return `vless://${UUID}@${params.address}:${params.port}?encryption=none&security=tls&${query}`;
+    case 'trojan': return `trojan://${UUID}@${params.address}:${params.port}?security=tls&${query}`;
+    case 'vmess': return `vmess://${toBase64(JSON.stringify({
+      v: '2', ps: name, add: params.address, port: String(params.port), id: UUID, aid: '0', scy: 'none', net: 'ws', type: 'none',
+      host: params.host, path: wsPath + (params.mode === 'cloudflare' ? '?ed=2560' : ''), tls: 'tls', sni: params.host, alpn: '', fp: '',
+      insecure: String(params.insecure), ...(params.extra || {}), vcn: '', pcs: params.pinned,
     }))}`;
     case 'shadowsocks': {
-      if (w.mode === 'ws' && TLS_INSECURE) {
+      if (params.mode === 'ws' && TLS_INSECURE) {
         console.error('[MODE] ws mode: Shadowsocks (v2ray-plugin) needs a trusted certificate, no SS link generated');
         return '';
       }
-      const plugin = `v2ray-plugin;tls;host=${w.host};path=${wsPath};mux=0`.replace(/;/g, '%3B').replace(/=/g, '%3D').replace(/\//g, '%2F');
-      return `ss://${SS_USERINFO}@${w.address}:${w.port}/?plugin=${plugin}#${encName}`;
+      const plugin = `v2ray-plugin;tls;host=${params.host};path=${wsPath};mux=0`.replace(/;/g, '%3B').replace(/=/g, '%3D').replace(/\//g, '%2F');
+      return `ss://${SS_USERINFO}@${params.address}:${params.port}/?plugin=${plugin}#${encodedName}`;
     }
   }
 }
 
-const realityNodes = () => ENABLED.filter((p) => REALITY_PORT[p]).map((p) => realityLink(p, REALITY_PORT[p], NAME));
-const wsNodes = (w) => ENABLED.filter((p) => WS_PROTOCOLS.includes(p))
-  .map((p) => wsLink(p, w, (REALITY_PORT[p] || CF_PROTOCOLS.includes(p)) ? `${NAME}-ws` : NAME));
-const cloudflareNodes = (w) => ENABLED.filter((p) => CF_PROTOCOLS.includes(p)).map((p) => wsLink(p, w, NAME));
+const realityNodes = () => ENABLED.filter((protocol) => REALITY_PORT[protocol])
+  .map((protocol) => realityLink(protocol, REALITY_PORT[protocol], NAME));
+const wsNodes = (params) => ENABLED.filter((protocol) => WS_PROTOCOLS.includes(protocol))
+  .map((protocol) => wsLink(protocol, params, (REALITY_PORT[protocol] || CF_PROTOCOLS.includes(protocol)) ? `${NAME}-ws` : NAME));
+const cloudflareNodes = (params) => ENABLED.filter((protocol) => CF_PROTOCOLS.includes(protocol))
+  .map((protocol) => wsLink(protocol, params, NAME));
 const hysteria2Link = () => `hysteria2://${UUID}@${PUBLIC_ADDRESS}:${HYSTERIA2_PORT}/?sni=${TLS_SERVER_NAME}${TLS_INSECURE ? '&insecure=1' : ''}#${ENCODED_NAME}`;
-const mixedLinks = () => ['socks5', 'http'].map((s) => `${s}://${UUID}:${UUID}@${PUBLIC_ADDRESS}:${MIXED_PORT}#${ENCODED_NAME}`).join('\n');
+const mixedLinks = () => ['socks5', 'http'].map((scheme) => `${scheme}://${UUID}:${UUID}@${PUBLIC_ADDRESS}:${MIXED_PORT}#${ENCODED_NAME}`).join('\n');
 const wireguardLink = () => `wireguard://${urlEncode(WG_CLIENT_PRIV)}@${PUBLIC_ADDRESS}:${WIREGUARD_PORT}?publickey=${urlEncode(WG_SERVER_PUB)}&address=${urlEncode(WG_CLIENT_ADDR)}&mtu=1420#${ENCODED_NAME}`;
 const wireguardConfig = () => `[Interface]\nPrivateKey = ${WG_CLIENT_PRIV}\nAddress = ${WG_CLIENT_ADDR}\nDNS = 1.1.1.1\nMTU = 1420\n\n[Peer]\nPublicKey = ${WG_SERVER_PUB}\nEndpoint = ${PUBLIC_ADDRESS}:${WIREGUARD_PORT}\nAllowedIPs = 0.0.0.0/0, ::/0\nPersistentKeepalive = 25\n`;
 
 // ========== 内置 HTTP 服务(订阅 + 回落) ==========
-function startWeb(subBody) {
-  const [dHost, dPort] = WEB_DESTINATION.split(':');
-  http.createServer((q, s) => {
-    const pathname = q.url.split('?')[0];
-    console.log(`[WEB] ${q.method} ${pathname === `/${UUID}` ? '/UUID' : pathname}`);
-    if ((q.method === 'GET' || q.method === 'HEAD') && pathname === `/${UUID}`) {
-      s.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8', 'Cache-Control': 'no-store' });
-      return s.end(q.method === 'HEAD' ? undefined : subBody);
+function startWeb(subscriptionBody) {
+  const [destHost, destPort] = WEB_DESTINATION.split(':');
+  http.createServer((incoming, response) => {
+    const pathname = incoming.url.split('?')[0];
+    console.log(`[WEB] ${incoming.method} ${pathname === `/${UUID}` ? '/UUID' : pathname}`);
+    if ((incoming.method === 'GET' || incoming.method === 'HEAD') && pathname === `/${UUID}`) {
+      response.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8', 'Cache-Control': 'no-store' });
+      return response.end(incoming.method === 'HEAD' ? undefined : subscriptionBody);
     }
-    if (!WEB_DESTINATION) { s.writeHead(404, { 'Content-Type': 'text/plain' }); return s.end('Not Found'); }
-    const up = http.request({ host: dHost, port: +dPort, path: q.url, method: q.method, headers: q.headers }, (ur) => { s.writeHead(ur.statusCode, ur.headers); ur.pipe(s); });
-    up.on('error', () => { s.writeHead(502); s.end(); });
-    q.pipe(up);
-  }).on('error', (e) => console.error(`[WEB] HTTP service failed: ${e.message}`)).listen(`\0${WEB_SOCKET.slice(1)}`);
+    if (!WEB_DESTINATION) { response.writeHead(404, { 'Content-Type': 'text/plain' }); return response.end('Not Found'); }
+    const upstream = http.request({ host: destHost, port: +destPort, path: incoming.url, method: incoming.method, headers: incoming.headers }, (upstreamResponse) => {
+      response.writeHead(upstreamResponse.statusCode, upstreamResponse.headers);
+      upstreamResponse.pipe(response);
+    });
+    upstream.on('error', () => { response.writeHead(502); response.end(); });
+    incoming.pipe(upstream);
+  }).on('error', (error) => console.error(`[WEB] HTTP service failed: ${error.message}`))
+    .listen(`\0${WEB_SOCKET.slice(1)}`);
 }
 
 // ========== 外部程序 ==========
-async function fetchBinary(name, url) {
-  const bin = path.join(WORK_DIR, name);
-  if (!await download(bin, url)) process.exit(1);
-  fs.chmodSync(bin, 0o755);
-  return bin;
+async function fetchBinary(fileName, url) {
+  const binPath = path.join(WORK_DIR, fileName);
+  if (!await download(binPath, url)) process.exit(1);
+  fs.chmodSync(binPath, 0o755);
+  return binPath;
 }
 
 async function startKomari() {
-  const name = `svc-k${h4}`;
-  await killPrevious(name, 'KOMARI');
-  const bin = await fetchBinary(name, `https://github.com/komari-monitor/komari-agent/releases/latest/download/komari-agent-linux-${ARCH}`);
+  const serviceName = `svc-k${uuidHashPrefix}`;
+  await killPrevious(serviceName, 'KOMARI');
+  const binPath = await fetchBinary(serviceName, `https://github.com/komari-monitor/komari-agent/releases/latest/download/komari-agent-linux-${ARCH}`);
   const agentEnv = { AGENT_ENDPOINT: KOMARI_ENDPOINT, AGENT_TOKEN: KOMARI_TOKEN };
   if (XRAY_ON) {
-    spawnBackground(bin, [], QUIET ? '/dev/null' : path.join(WORK_DIR, `${name}.log`), agentEnv);
+    spawnBackground(binPath, [], QUIET ? '/dev/null' : path.join(WORK_DIR, `${serviceName}.log`), agentEnv);
     return console.log(`[KOMARI] Agent started, reporting to ${KOMARI_ENDPOINT}`);
   }
   console.log(`[KOMARI] No proxy protocol enabled, running the agent only, reporting to ${KOMARI_ENDPOINT}`);
-  const child = cp.spawn(bin, [], { env: { ...process.env, ...GO_ENV, ...agentEnv }, stdio: STDIO });
-  children.push(child);
+  const child = childProcess.spawn(binPath, [], { env: { ...process.env, ...GO_ENV, ...agentEnv }, stdio: STDIO });
+  childProcesses.push(child);
   child.on('exit', (code) => process.exit(code ?? 1));
   await new Promise(() => {});
 }
 
 // 从 cloudflared 日志取第一条有具体域名、Service 为 http://localhost:端口 的 ingress 规则
-function parseIngress(text) {
-  const m = text.split('\n').filter((l) => l.includes('Updated to new configuration')).pop()?.match(/config="(.*)" version=/);
-  if (!m) return null;
+function parseIngress(logText) {
+  const configMatch = logText.split('\n')
+    .filter((line) => line.includes('Updated to new configuration'))
+    .pop()?.match(/config="(.*)" version=/);
+  if (!configMatch) return null;
   let config;
-  try { config = JSON.parse(m[1].replace(/\\"/g, '"')); } catch { return null; }
+  try { config = JSON.parse(configMatch[1].replace(/\\"/g, '"')); } catch { return null; }
   for (const rule of config.ingress || []) {
-    const sm = rule.hostname && !rule.hostname.includes('*') && /^http:\/\/(?:localhost|127\.0\.0\.1):(\d+)$/.exec(rule.service || '');
-    if (sm) return { hostname: rule.hostname, port: sm[1] };
+    const serviceMatch = rule.hostname && !rule.hostname.includes('*')
+      && /^http:\/\/(?:localhost|127\.0\.0\.1):(\d+)$/.exec(rule.service || '');
+    if (serviceMatch) return { hostname: rule.hostname, port: serviceMatch[1] };
   }
   return null;
 }
 
 async function startCloudflared() {
-  const name = `svc-c${h4}`;
-  await killPrevious(name, 'CF');
-  const bin = await fetchBinary(name, `https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${ARCH}`);
-  const logFile = path.join(WORK_DIR, `${name}.log`);
-  const fail = (msg) => { console.error(`[CF] ${msg}`); process.exit(1); };
-  cp.spawnSync(bin, ['--version'], { stdio: STDIO });
+  const serviceName = `svc-c${uuidHashPrefix}`;
+  await killPrevious(serviceName, 'CF');
+  const binPath = await fetchBinary(serviceName, `https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${ARCH}`);
+  const logFile = path.join(WORK_DIR, `${serviceName}.log`);
+  const fail = (message) => { console.error(`[CF] ${message}`); process.exit(1); };
+  childProcess.spawnSync(binPath, ['--version'], { stdio: STDIO });
 
   if (QUICK_TUNNEL) {
     CF_PORT = DEFAULT_FRONT_PORT;
     checkPorts();
-    spawnBackground(bin, ['--no-autoupdate', 'tunnel', '--url', `http://localhost:${CF_PORT}`], logFile);
-    for (let i = 0; i < 30 && !CF_HOSTNAME; i++) {
-      CF_HOSTNAME = [...readLog(logFile).matchAll(/https:\/\/([a-z0-9-]+\.trycloudflare\.com)/g)].map((m) => m[1]).find((h) => !h.startsWith('api.')) || '';
+    spawnBackground(binPath, ['--no-autoupdate', 'tunnel', '--url', `http://localhost:${CF_PORT}`], logFile);
+    for (let attempt = 0; attempt < 30 && !CF_HOSTNAME; attempt++) {
+      CF_HOSTNAME = [...readLog(logFile).matchAll(/https:\/\/([a-z0-9-]+\.trycloudflare\.com)/g)]
+        .map((match) => match[1])
+        .find((host) => !host.startsWith('api.')) || '';
       if (!CF_HOSTNAME) await sleep(1000);
     }
     if (!CF_HOSTNAME) fail(`Cannot find the trycloudflare.com hostname in ${logFile}, exiting`);
     console.log(`[CF] Quick tunnel hostname: ${CF_HOSTNAME} (service port=${CF_PORT})`);
   } else {
-    spawnBackground(bin, ['--no-autoupdate', 'tunnel', 'run'], logFile, { TUNNEL_TOKEN: CLOUDFLARE_TUNNEL_TOKEN });
-    for (let i = 0; i < 30 && !readLog(logFile).includes('Updated to new configuration'); i++) await sleep(1000);
-    const rule = parseIngress(readLog(logFile));
-    if (!rule || !validPort(rule.port)) fail(`Cannot read hostname / port from ${logFile} (needs a Public hostname without * and a Service like http://localhost:PORT), exiting`);
-    CF_HOSTNAME = rule.hostname;
-    CF_PORT = +rule.port;
+    spawnBackground(binPath, ['--no-autoupdate', 'tunnel', 'run'], logFile, { TUNNEL_TOKEN: CLOUDFLARE_TUNNEL_TOKEN });
+    for (let attempt = 0; attempt < 30 && !readLog(logFile).includes('Updated to new configuration'); attempt++) await sleep(1000);
+    const ingressRule = parseIngress(readLog(logFile));
+    if (!ingressRule || !validPort(ingressRule.port)) {
+      fail(`Cannot read hostname / port from ${logFile} (needs a Public hostname without * and a Service like http://localhost:PORT), exiting`);
+    }
+    CF_HOSTNAME = ingressRule.hostname;
+    CF_PORT = +ingressRule.port;
     checkPorts();
     console.log(`[CF] From cloudflared log: hostname=${CF_HOSTNAME}, tunnel service port=${CF_PORT}`);
   }
@@ -640,17 +678,18 @@ async function main() {
   }
 
   // ---- Xray ----
-  const xrayBin = path.join(WORK_DIR, `xray-${h4}`), extracted = path.join(WORK_DIR, 'xray');
+  const xrayBinPath = path.join(WORK_DIR, `xray-${uuidHashPrefix}`);
+  const extractedBinPath = path.join(WORK_DIR, 'xray');
   const configFile = path.join(WORK_DIR, 'config.json'), zipFile = path.join(WORK_DIR, 'xray.zip');
-  await killPrevious(`xray-${h4}`, 'XRAY');
+  await killPrevious(`xray-${uuidHashPrefix}`, 'XRAY');
   if (!await download(zipFile, `https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-${ARCH === 'amd64' ? '64' : 'arm64-v8a'}.zip`)) process.exit(1);
   await unzip(zipFile, WORK_DIR);
   fs.rmSync(zipFile, { force: true });
-  try { fs.renameSync(extracted, xrayBin); } catch (e) { console.error(`[XRAY] Cannot rename binary: ${e.message}`); }
-  if (!nonEmpty(xrayBin)) { console.error(`[XRAY] Binary not found after extraction: ${xrayBin}`); process.exit(1); }
-  fs.chmodSync(xrayBin, 0o755);
+  try { fs.renameSync(extractedBinPath, xrayBinPath); } catch (error) { console.error(`[XRAY] Cannot rename binary: ${error.message}`); }
+  if (!nonEmpty(xrayBinPath)) { console.error(`[XRAY] Binary not found after extraction: ${xrayBinPath}`); process.exit(1); }
+  fs.chmodSync(xrayBinPath, 0o755);
   const xrayEnv = { ...process.env, ...GO_ENV, XRAY_LOCATION_ASSET: WORK_DIR };
-  const runXray = (args) => cp.spawnSync(xrayBin, args, { stdio: STDIO, env: xrayEnv });
+  const runXray = (args) => childProcess.spawnSync(xrayBinPath, args, { stdio: STDIO, env: xrayEnv });
   runXray(['version']);
 
   // 先以 600 权限写入(含 UUID 和 Reality 私钥)，再测试配置
@@ -667,27 +706,28 @@ async function main() {
     WIREGUARD_PORT && wireguardLink(),
     MIXED_PORT && mixedLinks(),
   ];
-  const allNodes = nodes.filter(Boolean).map((n) => `${n}\n`).join('');
-  console.log(`\n=== Nodes ===\n${allNodes}\n=== Subscription (base64) ===\n${toB64(allNodes)}\n`);
+  const allNodes = nodes.filter(Boolean).map((node) => `${node}\n`).join('');
+  console.log(`\n=== Nodes ===\n${allNodes}\n=== Subscription (base64) ===\n${toBase64(allNodes)}\n`);
   if (WIREGUARD_PORT) console.log(`\n=== WireGuard config (wg-quick) ===\n${wireguardConfig()}`);
   if (WS_FRONT_ON || CF_FRONT_ON) {
-    startWeb(toB64(allNodes));
+    startWeb(toBase64(allNodes));
     const bases = [
       ...(CF_FRONT_ON && CF_HOSTNAME ? [`https://${CF_HOSTNAME}`] : []),
       ...(WS_FRONT_ON ? [`${FRONT_TLS ? 'https' : 'http'}://${PUBLIC_ADDRESS}:${FRONT_PORT}`] : []),
     ];
-    if (bases.length) console.log(`\n=== Subscription URL ===\n${bases.map((b) => `${b}/${UUID}`).join('\n')}${FRONT_TLS && TLS_INSECURE ? '\n(自签证书：客户端需要允许不校验证书)' : ''}\n`);
+    if (bases.length) console.log(`\n=== Subscription URL ===\n${bases.map((base) => `${base}/${UUID}`).join('\n')}${FRONT_TLS && TLS_INSECURE ? '\n(自签证书：客户端需要允许不校验证书)' : ''}\n`);
   }
 
   // ---- systemd 服务文件 ----
-  const svc = `cache-${uuidHash.slice(0, 6)}`, serviceFile = path.join(WORK_DIR, `${svc}.service`);
-  fs.writeFileSync(serviceFile, `[Unit]\nDescription=${svc}\nAfter=network.target\n\n[Service]\nType=simple\nRestart=always\nRestartSec=5\nWorkingDirectory=${WORK_DIR}\nExecStart=${process.execPath} ${SELF}\nKillMode=mixed\nKillSignal=SIGTERM\n\n[Install]\nWantedBy=multi-user.target\n`);
-  console.log(`\n=== systemd service (${svc}) ===\ncp ${serviceFile} /etc/systemd/system/${svc}.service\nsystemctl daemon-reload && systemctl enable --now ${svc}`);
+  const serviceName = `cache-${uuidHash.slice(0, 6)}`;
+  const serviceFilePath = path.join(WORK_DIR, `${serviceName}.service`);
+  fs.writeFileSync(serviceFilePath, `[Unit]\nDescription=${serviceName}\nAfter=network.target\n\n[Service]\nType=simple\nRestart=always\nRestartSec=5\nWorkingDirectory=${WORK_DIR}\nExecStart=${process.execPath} ${SCRIPT_PATH}\nKillMode=mixed\nKillSignal=SIGTERM\n\n[Install]\nWantedBy=multi-user.target\n`);
+  console.log(`\n=== systemd service (${serviceName}) ===\ncp ${serviceFilePath} /etc/systemd/system/${serviceName}.service\nsystemctl daemon-reload && systemctl enable --now ${serviceName}`);
 
-  try { req('v8').setFlagsFromString('--expose-gc'); req('vm').runInNewContext('gc')(); } catch {}
-  const xrayProcess = cp.spawn(xrayBin, ['run', '-c', configFile], { stdio: STDIO, env: xrayEnv });
-  children.push(xrayProcess);
+  try { requireBuiltin('v8').setFlagsFromString('--expose-gc'); requireBuiltin('vm').runInNewContext('gc')(); } catch {}
+  const xrayProcess = childProcess.spawn(xrayBinPath, ['run', '-c', configFile], { stdio: STDIO, env: xrayEnv });
+  childProcesses.push(xrayProcess);
   xrayProcess.on('exit', (code) => process.exit(code ?? 1));
 }
 
-main().catch((e) => { console.error(e); process.exit(1); });
+main().catch((error) => { console.error(error); process.exit(1); });
