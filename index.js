@@ -1,23 +1,23 @@
 #!/usr/bin/env node
 'use strict';
-// 纯 Node.js(>=16)，仅内置模块。每个 *_MODE 可逗号分隔：一个前置模式 ws/cloudflare + 一个 Reality 项(端口或回落协议名)
+// 纯 Node.js(>=16)，仅内置模块。每个 *_MODE 可逗号分隔：ws、cloudflare 各至多一个(可同时使用)，外加至多一个 Reality 项(端口或回落协议名)
+loadEnv(path.join(BASE_DIR, '.env'));
 const req = (m) => (typeof require === 'function' ? require(m) : process.getBuiltinModule(`node:${m}`));
 const [crypto, fs, path, cp, https, http, zlib, dns, tls] = ['crypto', 'fs', 'path', 'child_process', 'https', 'http', 'zlib', 'dns', 'tls'].map(req);
 const { X509Certificate } = crypto;
 const SELF = path.resolve(process.argv[1]), BASE_DIR = path.dirname(SELF);
+const env = (k, d = '') => (process.env[k] ?? d).trim();
+const mode = (k, d = '') => env(k, d).toLowerCase();
 
 // ========== 用户配置 ==========
 // 优先级：真实环境变量 > 同目录 .env > 默认值。变量"未设置"才用默认值，设成空就是关闭
-loadEnv(path.join(BASE_DIR, '.env'));
-const env = (k, d = '') => (process.env[k] ?? d).trim();
-const mode = (k, d = '') => env(k, d).toLowerCase();
 const CONFIG = {
   NAME: env('NAME', ''),
-  UUID: env('UUID') || crypto.randomUUID(),
+  UUID: env('UUID'),
   CLOUDFLARE_TUNNEL_TOKEN: env('CLOUDFLARE_TUNNEL_TOKEN'),
   CLOUDFLARE_IP: env('CLOUDFLARE_IP', 'www.gov.tw'),
-  PORT: env('PORT', '').replace(/^0+$/, ''),
-  CERT_HOST: env('CERT_HOST', '').replace(/^[a-z]+:\/\//i, '').replace(/[/:].*$/, ''),
+  PORT: env('PORT', ''),
+  CERT_HOST: env('CERT_HOST', ''),
   VLESS_MODE: mode('VLESS_MODE', 'trojan'),
   VMESS_MODE: mode('VMESS_MODE', ''),
   TROJAN_MODE: mode('TROJAN_MODE', 'vmess'),
@@ -30,6 +30,8 @@ const CONFIG = {
   KOMARI_TOKEN: env('KOMARI_TOKEN', ''),
   LOG_LEVEL: mode('LOG_LEVEL', 'warning'), // none / error / warning / info / debug
 };
+normalizeConfig(); // 先规范化，再解构，保证拿到的是规范化后的值
+if (CONFIG.LOG_LEVEL !== 'none') persistEnv(path.join(BASE_DIR, '.env'));
 const { NAME, UUID, CLOUDFLARE_TUNNEL_TOKEN, CLOUDFLARE_IP, PORT, VLESS_MODE, VMESS_MODE, TROJAN_MODE, SHADOWSOCKS_MODE,
   HYSTERIA2_MODE, MIXED_MODE, WIREGUARD_MODE, CERT_HOST, KOMARI_ENDPOINT, KOMARI_TOKEN, LOG_LEVEL } = CONFIG;
 
@@ -38,25 +40,14 @@ const QUIET = LOG_LEVEL === 'none';
 if (QUIET) console.log = console.error = () => {};
 const STDIO = QUIET ? 'ignore' : 'inherit';
 
-// Xray 进程名：只保留字母数字 . _ -，最长 15 个字符；为空则用 xray
-const PROCESS_NAME = NAME.replace(/[^A-Za-z0-9._-]/g, '').slice(0, 15) || 'xray';
-
-// 由 NAME + UUID 派生：目录名如 .fontcache2a3f，服务名如 mynode-2a3f1b
-const nameSlug = NAME.replace(/[^a-z0-9]/gi, '').toLowerCase().slice(0, 8) || 'cache';
+// 进程名、目录名、服务名都由 UUID 哈希派生，与 NAME 无关
 const uuidHash = crypto.createHash('sha256').update(UUID).digest('hex');
-const CACHE_DIR_NAME = `.${nameSlug}${uuidHash.slice(0, 4)}`;
-const SERVICE_NAME = `${nameSlug}-${uuidHash.slice(0, 6)}`;
-
-// Komari / cloudflared 的进程名：与 Xray 区分，形如 mynode-k2a3f、mynode-c2a3f
-const procBase = NAME.replace(/[^A-Za-z0-9._-]/g, '').slice(0, 9) || 'svc';
-const KOMARI_PROCESS = `${procBase}-k${uuidHash.slice(0, 4)}`;
-const CF_PROCESS = `${procBase}-c${uuidHash.slice(0, 4)}`;
 
 console.log('[ENV]', Object.entries(CONFIG).filter(([, v]) => v).map(([k, v]) => `${k}=${/UUID|TOKEN/.test(k) ? `${v.slice(0, 4)}***` : v}`).join(' '));
 
 // WORK_DIR 优先级：环境变量指定 > /var/lib/<派生名> > /tmp/<派生名>
 let WORK_DIR = '';
-for (const dir of new Set(CONFIG.WORK_DIR ? [path.resolve(BASE_DIR, CONFIG.WORK_DIR), `/var/lib/${CACHE_DIR_NAME}`, `/tmp/${CACHE_DIR_NAME}`] : [`/var/lib/${CACHE_DIR_NAME}`, `/tmp/${CACHE_DIR_NAME}`])) {
+for (const dir of new Set(CONFIG.WORK_DIR ? [path.resolve(BASE_DIR, CONFIG.WORK_DIR), `/var/lib/.cache${uuidHash.slice(0, 4)}`, `/tmp/.cache${uuidHash.slice(0, 4)}`] : [`/var/lib/.cache${uuidHash.slice(0, 4)}`, `/tmp/.cache${uuidHash.slice(0, 4)}`])) {
   try {
     fs.mkdirSync(dir, { recursive: true });
     fs.accessSync(dir, fs.constants.R_OK | fs.constants.W_OK);
@@ -78,10 +69,47 @@ function loadEnv(file) {
   }
 }
 
-// 把当前 UUID 写回脚本本身：下次运行直接沿用
-try {
-  fs.writeFileSync(SELF, fs.readFileSync(SELF, 'utf8').replace(/^ {2}UUID: .*$/m, () => `  UUID: env('UUID', '${UUID}') || crypto.randomUUID(),`));
-} catch (e) { console.error(`[UUID] Cannot persist UUID to script: ${e.message}`); }
+// 把当前全部配置(包括自动生成的 UUID)持久化到脚本同目录的 .env，下次运行直接沿用
+// 已存在的同名行用 replace 原地替换，其它行和注释保持不动；缺失的键追加到末尾
+// 含密钥和 UUID，文件权限设为 600
+// 规范化配置，所有模式都执行：UUID 未设置时随机生成；PORT 全为 0 视为未设置；CERT_HOST 只保留主机名
+function normalizeConfig() {
+  CONFIG.UUID = CONFIG.UUID || crypto.randomUUID();
+  CONFIG.PORT = CONFIG.PORT.replace(/^0+$/, '');
+  CONFIG.CERT_HOST = CONFIG.CERT_HOST.replace(/^[a-z]+:\/\//i, '').replace(/[/:].*$/, '');
+}
+
+// 持久化到 .env，并把脚本内的 CONFIG 改成只读取环境变量的形式
+function persistEnv(file) {
+  const line = (k, v) => `${k}=${/[\s#'"]/.test(v) ? `"${v}"` : v}`;
+  const append = (t, l) => t + (t && !t.endsWith('\n') ? '\n' : '') + l + '\n';
+  let text = readLog(file);
+  for (const [k, v] of Object.entries(CONFIG)) {
+    const pattern = new RegExp(`^\\s*(?:export\\s+)?${k}\\s*=.*$`, 'm');
+    text = pattern.test(text) ? text.replace(pattern, () => line(k, v)) : append(text, line(k, v));
+  }
+  try {
+    fs.writeFileSync(file, text, { mode: 0o600 });
+    fs.chmodSync(file, 0o600);
+  } catch (e) { console.error(`[ENV] Cannot write ${file}: ${e.message}`); }
+  rewriteConfigToEnvReads();
+}
+
+// .env 已包含全部配置，CONFIG 每项改为只读取环境变量：KEY: env('KEY')
+// *_MODE 和 LOG_LEVEL 用 mode() 读取，保持小写处理
+function rewriteConfigToEnvReads() {
+  try {
+    const source = fs.readFileSync(SELF, 'utf8');
+    const block = source.match(/^const CONFIG = \{\n[\s\S]*?\n\};/m);
+    if (!block) return console.error('[ENV] CONFIG block not found, script not rewritten');
+    const rewritten = block[0].split('\n').map((l) => {
+      const key = (l.match(/^  ([A-Z0-9_]+): /) || [])[1];
+      if (!key || !(key in CONFIG)) return l;
+      return `  ${key}: ${/_MODE$|^LOG_LEVEL$/.test(key) ? 'mode' : 'env'}('${key}'),`;
+    }).join('\n');
+    fs.writeFileSync(SELF, source.replace(block[0], () => rewritten));
+  } catch (e) { console.error(`[ENV] Cannot rewrite script: ${e.message}`); }
+}
 
 process.chdir(WORK_DIR);
 const ARCH = { x64: 'amd64', arm64: 'arm64' }[process.arch];
@@ -193,8 +221,10 @@ const DEFAULT_FRONT_PORT = 8000, WG_CLIENT_ADDR = '10.0.0.2/32';
 const MODES = { vless: VLESS_MODE, vmess: VMESS_MODE, trojan: TROJAN_MODE, shadowsocks: SHADOWSOCKS_MODE };
 const NUMERIC_PORT = {}, FALLBACK = {}, FALLBACK_PARENT = {};
 const CHAIN = {}, HEAD_PORT = {}, REALITY_PORT = {};
-const ENABLED = [], WS_PROTOCOLS = [], CHAIN_HEADS = [];
-let ACTIVE_MODE = '', QUICK_TUNNEL = false, FRONT_ON = false, SHARE_FRONT = false, FRONT_TLS = false, FRONT_PORT = 0, XRAY_ON = false;
+const ENABLED = [], WS_PROTOCOLS = [], CF_PROTOCOLS = [], CHAIN_HEADS = [];
+const FRONT_PROTOCOLS = () => [...new Set([...WS_PROTOCOLS, ...CF_PROTOCOLS])];
+let HAS_WS = false, HAS_CF = false, QUICK_TUNNEL = false, WS_FRONT_ON = false, CF_FRONT_ON = false;
+let SHARE_FRONT = false, FRONT_TLS = false, FRONT_PORT = 0, CF_PORT = 0, XRAY_ON = false;
 const ENCODED_NAME = urlEncode(NAME);
 
 // 前置入口的非 ws 请求回落到内置 HTTP 服务：/UUID 返回订阅，其它路径转给 CERT_HOST:80
@@ -220,12 +250,13 @@ const WIREGUARD_PORT = modePort('WIREGUARD_MODE', WIREGUARD_MODE, 'udp: wireguar
 function parseModes() {
   for (const protocol of PROTOCOLS) {
     const v = `${protocol.toUpperCase()}_MODE`;
-    let hasFront = false, hasReality = false;
+    let hasReality = false;
     for (const token of (MODES[protocol] || '').split(',').map((s) => s.trim()).filter(Boolean)) {
       if (token === 'ws' || token === 'cloudflare') {
-        if (hasFront) die(`${v}: only one of ws / cloudflare is allowed`);
-        if (ACTIVE_MODE && ACTIVE_MODE !== token) die(`Protocols using ws / cloudflare share one port (PORT), so they must use the same mode (got: ${ACTIVE_MODE} ${token})`);
-        hasFront = true; WS_PROTOCOLS.push(protocol); ACTIVE_MODE = token;
+        const list = token === 'ws' ? WS_PROTOCOLS : CF_PROTOCOLS;
+        if (list.includes(protocol)) die(`${v}: '${token}' is given more than once`);
+        list.push(protocol);
+        if (token === 'ws') HAS_WS = true; else HAS_CF = true;
         continue;
       }
       if (hasReality) die(`${v}: only one Reality entry (a port or a fallback protocol) is allowed`);
@@ -241,7 +272,7 @@ function parseModes() {
       } else die(`${v}='${token}' is invalid (expected: ws / cloudflare / a port / a protocol name, comma separated, or empty to disable)`);
     }
   }
-  QUICK_TUNNEL = ACTIVE_MODE === 'cloudflare' && CLOUDFLARE_TUNNEL_TOKEN === 'try';
+  QUICK_TUNNEL = HAS_CF && CLOUDFLARE_TUNNEL_TOKEN === 'try';
 }
 
 // 2. 把回落关系整理成 Reality 链
@@ -261,7 +292,7 @@ function buildChains() {
   }
   for (const p of PROTOCOLS) {
     const hasReality = !!(NUMERIC_PORT[p] || FALLBACK[p]);
-    if (WS_PROTOCOLS.includes(p) || hasReality || FALLBACK_PARENT[p]) ENABLED.push(p);
+    if (FRONT_PROTOCOLS().includes(p) || hasReality || FALLBACK_PARENT[p]) ENABLED.push(p);
     if (hasReality && !FALLBACK_PARENT[p]) CHAIN_HEADS.push(p);
   }
   for (const head of CHAIN_HEADS) {
@@ -275,23 +306,27 @@ function buildChains() {
   for (const p of ENABLED) if ((NUMERIC_PORT[p] || FALLBACK[p] || FALLBACK_PARENT[p]) && !REALITY_PORT[p]) die(`${p.toUpperCase()} is part of a fallback loop: the chain needs a head that no protocol falls back to`);
 }
 
-// 3. 前置入口：是否需要、监听端口、是否与某条 Reality 链共用
+// 3. 前置入口：ws 入口监听 PORT(无则默认端口)，可与某条 Reality 链共用端口；
+// cloudflare 入口的端口不取自 PORT，启动隧道后由 cloudflared 日志决定
 function planFront() {
-  if (!ACTIVE_MODE && !PORT) return;
-  FRONT_ON = true;
-  const fp = ACTIVE_MODE === 'cloudflare' ? DEFAULT_FRONT_PORT : (PORT || DEFAULT_FRONT_PORT);
-  if (!validPort(String(fp))) die(`PORT='${PORT}' is not a valid port`);
-  FRONT_PORT = +fp;
-  if (PORT && ACTIVE_MODE !== 'cloudflare' && CHAIN_HEADS.some((h) => HEAD_PORT[h] === FRONT_PORT)) SHARE_FRONT = true;
+  // 没有 cloudflare 协议时，设置了 PORT 也开一个 ws 入口(用于提供订阅)
+  WS_FRONT_ON = HAS_WS || (!!PORT && !HAS_CF);
+  CF_FRONT_ON = HAS_CF;
+  if (WS_FRONT_ON) {
+    if (PORT && !validPort(PORT)) die(`PORT='${PORT}' is not a valid port`);
+    FRONT_PORT = +(PORT || DEFAULT_FRONT_PORT);
+    if (PORT && CHAIN_HEADS.some((h) => HEAD_PORT[h] === FRONT_PORT)) SHARE_FRONT = true;
+  }
 }
 
 // 4. 端口检查
 function checkPorts() {
   const ports = CHAIN_HEADS.map((h) => HEAD_PORT[h]);
-  if (FRONT_ON && !SHARE_FRONT) ports.push(FRONT_PORT);
+  if (WS_FRONT_ON && !SHARE_FRONT) ports.push(FRONT_PORT);
+  if (CF_FRONT_ON && CF_PORT) ports.push(CF_PORT);
   if (MIXED_PORT) ports.push(MIXED_PORT);
   const dup = ports.find((p, i) => ports.indexOf(p) !== i);
-  if (dup !== undefined) die(`Port ${dup} is used more than once: every Reality chain, the ws / cloudflare group (PORT) and MIXED_MODE need different TCP ports`);
+  if (dup !== undefined) die(`Port ${dup} is used more than once: every Reality chain, the ws front (PORT), the cloudflare tunnel port and MIXED_MODE need different TCP ports`);
   const bad = ports.find((p) => p === SS_PORT || p === SS_WS_PORT);
   if (bad !== undefined) die(`Port ${bad} conflicts with the internal ports 40004 / 40005 used by Shadowsocks`);
 }
@@ -442,17 +477,23 @@ const inbound = (tag, listen, port, protocol, settings, stream) => ({ tag, liste
 
 function buildConfig() {
   const inbounds = [];
-  if (FRONT_ON) {
-    // 前置入口：按路径把 ws 流量回落给各内部 ws 入口，其余回落给内置 HTTP 服务
-    const fallbacks = [];
-    for (const p of WS_PROTOCOLS) {
-      const ep = wsInternalEndpoint(p);
-      fallbacks.push({ path: WS_PATH[p], dest: ep.dest, xver: 0 });
-      inbounds.push(inbound(`${p}-ws-in`, ep.listen, ep.port, p, protocolSettings(p), streamWs(WS_PATH[p])));
-    }
-    fallbacks.push({ dest: WEB_SOCKET, xver: 0 });
+  // 每个前置协议都有一个内部 ws 入口，由前置入口按路径回落过来
+  for (const p of FRONT_PROTOCOLS()) {
+    const ep = wsInternalEndpoint(p);
+    inbounds.push(inbound(`${p}-ws-in`, ep.listen, ep.port, p, protocolSettings(p), streamWs(WS_PATH[p])));
+  }
+  // 前置入口：按路径回落到内部 ws 入口，其余回落到内置 HTTP 服务
+  const frontFallbacks = (protocols) => [
+    ...protocols.map((p) => ({ path: WS_PATH[p], dest: wsInternalEndpoint(p).dest, xver: 0 })),
+    { dest: WEB_SOCKET, xver: 0 },
+  ];
+  if (WS_FRONT_ON) {
     const [listen, port] = SHARE_FRONT ? [FRONT_SOCKET, undefined] : ['::', FRONT_PORT];
-    inbounds.push(inbound('front-in', listen, port, 'vless', protocolSettings('vless', fallbacks), FRONT_TLS ? streamTls('tcp', 'http/1.1') : streamTcp()));
+    inbounds.push(inbound('front-in', listen, port, 'vless', protocolSettings('vless', frontFallbacks(WS_PROTOCOLS)), FRONT_TLS ? streamTls('tcp', 'http/1.1') : streamTcp()));
+  }
+  if (CF_FRONT_ON) {
+    // cloudflare 入口为明文 TCP，TLS 由 Cloudflare 边缘终止
+    inbounds.push(inbound('cf-front-in', '::', CF_PORT, 'vless', protocolSettings('vless', frontFallbacks(CF_PROTOCOLS)), streamTcp()));
   }
   for (const head of CHAIN_HEADS) { // Reality 链：链头监听自己的端口套 Reality；其余监听内部地址
     for (const p of CHAIN[head]) {
@@ -492,32 +533,28 @@ function realityLink(p, port, name) {
   return `${p === 'shadowsocks' ? 'ss' : p}://${p === 'shadowsocks' ? SS_USERINFO : UUID}@${PUBLIC_ADDRESS}:${port}?${prefix}${q}#${urlEncode(name)}`;
 }
 
-// ws / cloudflare 链接的共同参数
-function wsParams() {
-  if (ACTIVE_MODE === 'cloudflare') return { address: CLOUDFLARE_IP || CF_HOSTNAME, port: 443, host: CF_HOSTNAME, insecureQuery: '', vmessInsecure: 0, vmessExtra: null, vmessPinnedCert: '' };
+// ws / cloudflare 链接的共同参数，mode 为 'ws' 或 'cloudflare'
+function wsParams(mode) {
+  if (mode === 'cloudflare') return { mode, address: CLOUDFLARE_IP || CF_HOSTNAME, port: 443, host: CF_HOSTNAME, insecureQuery: '', vmessInsecure: 0, vmessExtra: null, vmessPinnedCert: '' };
   const insecure = TLS_INSECURE ? 1 : 0;
   return {
-    address: PUBLIC_ADDRESS, port: FRONT_PORT, host: TLS_SERVER_NAME, vmessInsecure: insecure, vmessPinnedCert: TLS_PINNED_CERT_SHA256,
+    mode, address: PUBLIC_ADDRESS, port: FRONT_PORT, host: TLS_SERVER_NAME, vmessInsecure: insecure, vmessPinnedCert: TLS_PINNED_CERT_SHA256,
     vmessExtra: { allowInsecure: insecure, verify_cert: !TLS_INSECURE }, insecureQuery: TLS_INSECURE ? `&allowInsecure=1&pcs=${TLS_PINNED_CERT_SHA256}` : '',
   };
 }
 
 function wsLink(p, w, name) {
   const encName = urlEncode(name), wsPath = WS_PATH[p], encPath = wsPath.replace(/\//g, '%2F');
-  if (ACTIVE_MODE === 'cloudflare' && (!CF_HOSTNAME || !CLOUDFLARE_TUNNEL_TOKEN)) {
-    console.error(`[MODE] cloudflare mode needs CLOUDFLARE_TUNNEL_TOKEN (set it to 'try' for a quick tunnel) and a tunnel hostname found in the cloudflared log, no ${p} link generated`);
-    return '';
-  }
   const q = `sni=${w.host}&fp=chrome&type=ws&host=${w.host}&path=${encPath}${w.insecureQuery}#${encName}`;
   switch (p) {
     case 'vless': return `vless://${UUID}@${w.address}:${w.port}?encryption=none&security=tls&${q}`;
     case 'trojan': return `trojan://${UUID}@${w.address}:${w.port}?security=tls&${q}`;
     case 'vmess': return `vmess://${toB64(JSON.stringify({
       v: '2', ps: name, add: w.address, port: String(w.port), id: UUID, aid: '0', scy: 'none', net: 'ws', type: 'none',
-      host: w.host, path: wsPath + (ACTIVE_MODE === 'cloudflare' ? '?ed=2560' : ''), tls: 'tls', sni: w.host, alpn: '', fp: '', insecure: String(w.vmessInsecure), ...(w.vmessExtra || {}), vcn: '', pcs: w.vmessPinnedCert,
+      host: w.host, path: wsPath + (w.mode === 'cloudflare' ? '?ed=2560' : ''), tls: 'tls', sni: w.host, alpn: '', fp: '', insecure: String(w.vmessInsecure), ...(w.vmessExtra || {}), vcn: '', pcs: w.vmessPinnedCert,
     }))}`; // ?ed=2560 为 0-RTT early data
     case 'shadowsocks': { // v2ray-plugin 无法跳过证书校验，自签证书下不输出
-      if (ACTIVE_MODE === 'ws' && TLS_INSECURE) {
+      if (w.mode === 'ws' && TLS_INSECURE) {
         console.error(`[MODE] ws mode: Shadowsocks (v2ray-plugin) needs a trusted certificate, put one at ${WORK_DIR}/<CERT_HOST>.crt and .key. No SS link generated`);
         return '';
       }
@@ -527,14 +564,15 @@ function wsLink(p, w, name) {
   }
 }
 
-// 一个协议可能输出两条链接(Reality + ws / cloudflare)，两条都有时节点名加后缀
-function generateNodes(p, w) {
-  const both = !!REALITY_PORT[p] && WS_PROTOCOLS.includes(p);
-  return [
-    REALITY_PORT[p] && realityLink(p, REALITY_PORT[p], both ? `${NAME}-reality` : NAME),
-    WS_PROTOCOLS.includes(p) && wsLink(p, w, both ? `${NAME}-${ACTIVE_MODE}` : NAME),
-  ].filter(Boolean);
-}
+// 节点顺序：Reality(VLESS -> VMESS -> TROJAN -> SHADOWSOCKS) -> 前置入口(ws / cloudflare)
+// Reality 与 cloudflare 节点不加后缀；ws 模式下若同一协议也有 Reality，ws 节点加 -ws 以示区分
+const realityNodes = () => ENABLED.filter((p) => REALITY_PORT[p]).map((p) => realityLink(p, REALITY_PORT[p], NAME));
+// ws 前置节点：同一协议还有 Reality 或 cloudflare 时加 -ws 后缀，避免节点同名
+const wsNodes = (w) => ENABLED.filter((p) => WS_PROTOCOLS.includes(p))
+  .map((p) => wsLink(p, w, (REALITY_PORT[p] || CF_PROTOCOLS.includes(p)) ? `${NAME}-ws` : NAME));
+// cloudflare 前置节点：不加后缀
+const cloudflareNodes = (w) => ENABLED.filter((p) => CF_PROTOCOLS.includes(p))
+  .map((p) => wsLink(p, w, NAME));
 
 const hysteria2Link = () => `hysteria2://${UUID}@${PUBLIC_ADDRESS}:${HYSTERIA2_PORT}/?sni=${TLS_SERVER_NAME}${TLS_INSECURE ? '&insecure=1' : ''}#${ENCODED_NAME}`;
 const mixedLinks = () => ['socks5', 'http'].map((s) => `${s}://${UUID}:${UUID}@${PUBLIC_ADDRESS}:${MIXED_PORT}#${ENCODED_NAME}`).join('\n');
@@ -570,11 +608,11 @@ async function fetchBinary(processName, url) {
 
 // Komari 探针：有代理协议时后台运行；没有时前台运行
 async function startKomari() {
-  await killPrevious(KOMARI_PROCESS, 'KOMARI');
-  const bin = await fetchBinary(KOMARI_PROCESS, `https://github.com/komari-monitor/komari-agent/releases/latest/download/komari-agent-linux-${ARCH}`);
+  await killPrevious(`svc-k${uuidHash.slice(0, 4)}`, 'KOMARI');
+  const bin = await fetchBinary(`svc-k${uuidHash.slice(0, 4)}`, `https://github.com/komari-monitor/komari-agent/releases/latest/download/komari-agent-linux-${ARCH}`);
   const agentEnv = { AGENT_ENDPOINT: KOMARI_ENDPOINT, AGENT_TOKEN: KOMARI_TOKEN };
   if (XRAY_ON) {
-    spawnBackground(bin, [], QUIET ? '/dev/null' : path.join(WORK_DIR, `${KOMARI_PROCESS}.log`), agentEnv);
+    spawnBackground(bin, [], QUIET ? '/dev/null' : path.join(WORK_DIR, `svc-k${uuidHash.slice(0, 4)}.log`), agentEnv);
     return console.log(`[KOMARI] Agent started, reporting to ${KOMARI_ENDPOINT}`);
   }
   console.log(`[KOMARI] No proxy protocol enabled, running the agent only, reporting to ${KOMARI_ENDPOINT}`);
@@ -597,35 +635,40 @@ function parseIngress(text) {
   return null;
 }
 
-// cloudflare 模式：Token 跑固定隧道；填 try 用临时隧道。域名和回源端口都从日志取
-// 日志文件只用于解析域名，LOG_LEVEL=none 时解析完即删除
+// cloudflare 模式：Token 跑固定隧道；填 try 用临时隧道。域名和回源端口都只从 cloudflared 日志取，取不到就报错退出
+// 日志文件只用于解析，LOG_LEVEL=none 时解析完即删除
 async function startCloudflared() {
-  await killPrevious(CF_PROCESS, 'CF');
-  const bin = await fetchBinary(CF_PROCESS, `https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${ARCH}`);
-  const logFile = path.join(WORK_DIR, `${CF_PROCESS}.log`);
+  await killPrevious(`svc-c${uuidHash.slice(0, 4)}`, 'CF');
+  const bin = await fetchBinary(`svc-c${uuidHash.slice(0, 4)}`, `https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${ARCH}`);
+  const logFile = path.join(WORK_DIR, `svc-c${uuidHash.slice(0, 4)}.log`);
   const discardLog = () => { if (QUIET) fs.rmSync(logFile, { force: true }); };
+  const fail = (msg) => { console.error(`[CF] ${msg}`); process.exit(1); };
   cp.spawnSync(bin, ['--version'], { stdio: STDIO });
 
   if (QUICK_TUNNEL) {
-    spawnBackground(bin, ['--no-autoupdate', 'tunnel', '--url', `http://localhost:${FRONT_PORT}`], logFile);
+    // 临时隧道：回源端口为脚本固定的 DEFAULT_FRONT_PORT，域名从日志取
+    CF_PORT = DEFAULT_FRONT_PORT;
+    checkPorts();
+    spawnBackground(bin, ['--no-autoupdate', 'tunnel', '--url', `http://localhost:${CF_PORT}`], logFile);
     for (let i = 0; i < 30 && !CF_HOSTNAME; i++) {
       CF_HOSTNAME = [...readLog(logFile).matchAll(/https:\/\/([a-z0-9-]+\.trycloudflare\.com)/g)].map((m) => m[1]).find((h) => !h.startsWith('api.')) || '';
       if (!CF_HOSTNAME) await sleep(1000);
     }
-    if (CF_HOSTNAME) console.log(`[CF] Quick tunnel hostname from log: ${CF_HOSTNAME} (service port=${FRONT_PORT})`);
-    else console.error(`[CF] Cannot find the trycloudflare.com hostname in ${logFile}`);
+    if (!CF_HOSTNAME) fail(`Cannot find the trycloudflare.com hostname in ${logFile}, exiting`);
+    console.log(`[CF] Quick tunnel hostname from log: ${CF_HOSTNAME} (service port=${CF_PORT})`);
     return discardLog();
   }
 
   spawnBackground(bin, ['--no-autoupdate', 'tunnel', 'run'], logFile, { TUNNEL_TOKEN: CLOUDFLARE_TUNNEL_TOKEN });
   for (let i = 0; i < 30 && !readLog(logFile).includes('Updated to new configuration'); i++) await sleep(1000);
   const rule = parseIngress(readLog(logFile));
-  if (rule && validPort(rule.port)) {
-    CF_HOSTNAME = rule.hostname;
-    FRONT_PORT = +rule.port;
-    checkPorts();
-    console.log(`[CF] From cloudflared log: hostname=${CF_HOSTNAME}, tunnel service port=${FRONT_PORT}`);
-  } else console.error(`[CF] Cannot read hostname / port from ${logFile} (the tunnel needs a Public hostname without * and a Service like http://localhost:PORT)`);
+  if (!rule || !validPort(rule.port)) {
+    fail(`Cannot read hostname / port from ${logFile} (the tunnel needs a Public hostname without * and a Service like http://localhost:PORT), exiting`);
+  }
+  CF_HOSTNAME = rule.hostname;
+  CF_PORT = +rule.port; // cloudflare 入口端口以 cloudflared 日志为准，与 PORT 无关
+  checkPorts();
+  console.log(`[CF] From cloudflared log: hostname=${CF_HOSTNAME}, tunnel service port=${CF_PORT}`);
   discardLog();
 }
 
@@ -634,11 +677,12 @@ async function main() {
   parseModes();
   buildChains();
   planFront();
-  FRONT_TLS = ACTIVE_MODE === 'ws' || SHARE_FRONT;
+  FRONT_TLS = HAS_WS || SHARE_FRONT;
   checkPorts();
 
   if (ENABLED.length) console.log(`[MODE] enabled=${ENABLED.join(' ')}`);
-  if (ACTIVE_MODE) console.log(`[MODE] port ${FRONT_PORT}: ${ACTIVE_MODE} (${WS_PROTOCOLS.join(' ')})${SHARE_FRONT ? ' shared with reality' : ''}`);
+  if (WS_FRONT_ON) console.log(`[MODE] port ${FRONT_PORT}: ws (${WS_PROTOCOLS.join(' ') || 'subscription only'})${SHARE_FRONT ? ' shared with reality' : ''}`);
+  if (CF_FRONT_ON) console.log(`[MODE] cloudflare: ${CF_PROTOCOLS.join(' ')} (tunnel port decided by cloudflared log)`);
   for (const head of CHAIN_HEADS) console.log(`[MODE] port ${HEAD_PORT[head]}: reality (${CHAIN[head].join(' -> ')})`);
   VLESS_FLOW = CHAIN_HEADS.includes('vless') ? 'xtls-rprx-vision' : ''; // Vision 仅 VLESS 作 Reality 链头时支持
 
@@ -657,21 +701,24 @@ async function main() {
   }
   SS_USERINFO = Buffer.from(`aes-256-gcm:${UUID}`).toString('base64url');
 
-  if (ACTIVE_MODE !== 'cloudflare' || CHAIN_HEADS.length || HYSTERIA2_PORT || MIXED_PORT || WIREGUARD_PORT) await resolvePublicAddress();
+  if (WS_FRONT_ON || CHAIN_HEADS.length || HYSTERIA2_PORT || MIXED_PORT || WIREGUARD_PORT) await resolvePublicAddress();
   IPV6_AVAILABLE = await request(TRACE_URL, { family: 6, timeout: 5000 }).then(() => true, () => false);
   console.log(IPV6_AVAILABLE ? '[NET] IPv6 egress: available' : '[NET] IPv6 egress: unavailable, blocking IPv6 destinations');
   if (FRONT_TLS || HYSTERIA2_PORT) setupTls();
-  if (ACTIVE_MODE === 'cloudflare' && CLOUDFLARE_TUNNEL_TOKEN) await startCloudflared();
+  if (HAS_CF) {
+    if (!CLOUDFLARE_TUNNEL_TOKEN) die('cloudflare mode needs CLOUDFLARE_TUNNEL_TOKEN (a tunnel token, or try for a quick tunnel)');
+    await startCloudflared();
+  }
 
   // ---- Xray ----
-  // 解压出 xray 后改名为 PROCESS_NAME(取自 NAME)，ps / top 里就显示这个名字
-  const xrayBinary = path.join(WORK_DIR, PROCESS_NAME), extracted = path.join(WORK_DIR, 'xray');
+  // 解压出 xray 后改名为 xray-<UUID 哈希前 4 位>，ps / top 里就显示这个名字
+  const xrayBinary = path.join(WORK_DIR, `xray-${uuidHash.slice(0, 4)}`), extracted = path.join(WORK_DIR, 'xray');
   const configFile = path.join(WORK_DIR, 'config.json'), zipFile = path.join(WORK_DIR, 'xray.zip');
-  await killPrevious(PROCESS_NAME, 'XRAY');
+  await killPrevious(`xray-${uuidHash.slice(0, 4)}`, 'XRAY');
   if (!await download(zipFile, `https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-${ARCH === 'amd64' ? '64' : 'arm64-v8a'}.zip`)) process.exit(1);
   await unzip(zipFile, WORK_DIR);
   fs.rmSync(zipFile, { force: true });
-  if (PROCESS_NAME !== 'xray') { try { fs.renameSync(extracted, xrayBinary); } catch (e) { console.error(`[XRAY] Cannot rename binary: ${e.message}`); } }
+  try { fs.renameSync(extracted, xrayBinary); } catch (e) { console.error(`[XRAY] Cannot rename binary: ${e.message}`); }
   try { fs.chmodSync(xrayBinary, 0o755); } catch { /* 下面统一检查 */ }
   if (!nonEmpty(xrayBinary)) { console.error(`[XRAY] Binary not found after extraction: ${xrayBinary}`); process.exit(1); }
   const xrayEnv = { ...process.env, ...GO_ENV, XRAY_LOCATION_ASSET: WORK_DIR };
@@ -684,31 +731,37 @@ async function main() {
   if (runXray(['run', '-test', '-c', configFile]).status !== 0) { console.error('[XRAY] Config test failed, aborting'); process.exit(1); }
 
   // ---- 输出订阅 ----
-  const wsInfo = ACTIVE_MODE ? wsParams() : null;
-  const nodes = ENABLED.flatMap((p) => generateNodes(p, wsInfo));
-  if (HYSTERIA2_PORT) nodes.push(hysteria2Link());
-  if (MIXED_PORT) nodes.push(mixedLinks());
-  if (WIREGUARD_PORT) nodes.push(wireguardLink());
+  // 顺序：Reality 节点 -> ws 节点 -> cloudflare 节点 -> Hysteria2 -> WireGuard -> Mixed
+  const nodes = [
+    ...realityNodes(),
+    ...(HAS_WS ? wsNodes(wsParams('ws')) : []),
+    ...(HAS_CF && CF_HOSTNAME ? cloudflareNodes(wsParams('cloudflare')) : []),
+    HYSTERIA2_PORT && hysteria2Link(),
+    WIREGUARD_PORT && wireguardLink(),
+    MIXED_PORT && mixedLinks(),
+  ];
   const allNodes = nodes.filter(Boolean).map((n) => `${n}\n`).join('');
   console.log(`\n=== Nodes ===\n${allNodes}\n=== Subscription (base64) ===\n${toB64(allNodes)}\n`);
   if (WIREGUARD_PORT) console.log(`\n=== WireGuard config (wg-quick) ===\n${wireguardConfig()}`);
-  if (FRONT_ON) {
+  if (WS_FRONT_ON || CF_FRONT_ON) {
     startWeb(toB64(allNodes));
-    const baseUrl = ACTIVE_MODE === 'cloudflare' ? (CF_HOSTNAME && `https://${CF_HOSTNAME}`) : `${FRONT_TLS ? 'https' : 'http'}://${PUBLIC_ADDRESS}:${FRONT_PORT}`;
-    if (baseUrl) console.log(`\n=== Subscription URL ===\n${baseUrl}/${UUID}${FRONT_TLS && TLS_INSECURE ? '\n(自签证书：客户端需要允许不校验证书)' : ''}\n`);
+    const bases = [];
+    if (CF_FRONT_ON && CF_HOSTNAME) bases.push(`https://${CF_HOSTNAME}`);
+    if (WS_FRONT_ON) bases.push(`${FRONT_TLS ? 'https' : 'http'}://${PUBLIC_ADDRESS}:${FRONT_PORT}`);
+    if (bases.length) console.log(`\n=== Subscription URL ===\n${bases.map((b) => `${b}/${UUID}`).join('\n')}${FRONT_TLS && TLS_INSECURE ? '\n(自签证书：客户端需要允许不校验证书)' : ''}\n`);
   }
 
   // ---- systemd 服务文件 ----
-  const serviceFile = path.join(WORK_DIR, `${SERVICE_NAME}.service`);
+  const serviceFile = path.join(WORK_DIR, `cache-${uuidHash.slice(0, 6)}.service`);
   fs.writeFileSync(serviceFile, [
-    '[Unit]', `Description=${SERVICE_NAME}`, 'After=network.target', '',
+    '[Unit]', `Description=cache-${uuidHash.slice(0, 6)}`, 'After=network.target', '',
     '[Service]', 'Type=simple', 'Restart=always', 'RestartSec=5', `WorkingDirectory=${WORK_DIR}`,
     `ExecStart=${process.execPath} ${SELF}`, 'KillMode=mixed', 'KillSignal=SIGTERM', '',
     '[Install]', 'WantedBy=multi-user.target', '',
   ].join('\n'));
-  console.log(`\n=== systemd service (${SERVICE_NAME}) ===`);
-  console.log(`cp ${serviceFile} /etc/systemd/system/${SERVICE_NAME}.service`);
-  console.log(`systemctl daemon-reload && systemctl enable --now ${SERVICE_NAME}`);
+  console.log(`\n=== systemd service (cache-${uuidHash.slice(0, 6)}) ===`);
+  console.log(`cp ${serviceFile} /etc/systemd/system/cache-${uuidHash.slice(0, 6)}.service`);
+  console.log(`systemctl daemon-reload && systemctl enable --now cache-${uuidHash.slice(0, 6)}`);
 
   try { req('v8').setFlagsFromString('--expose-gc'); req('vm').runInNewContext('gc')(); } catch { /* 没有就算了 */ }
   const xrayProcess = cp.spawn(xrayBinary, ['run', '-c', configFile], { stdio: STDIO, env: xrayEnv });
