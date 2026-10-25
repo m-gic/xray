@@ -41,25 +41,22 @@ if (QUIET) console.log = console.error = () => {};
 const STDIO = QUIET ? 'ignore' : 'inherit';
 const uuidHash = crypto.createHash('sha256').update(UUID).digest('hex');
 const h4 = uuidHash.slice(0, 4);
+const ARCH = { x64: 'amd64', arm64: 'arm64' }[process.arch];
 
 console.log('[ENV]', Object.entries(CONFIG).filter(([, v]) => v).map(([k, v]) => `${k}=${/UUID|TOKEN/.test(k) ? `${v.slice(0, 4)}***` : v}`).join(' '));
 
 let WORK_DIR = '';
 for (const dir of [...(CONFIG.WORK_DIR ? [path.resolve(BASE_DIR, CONFIG.WORK_DIR)] : []), `/var/lib/.cache${h4}`, `/tmp/.cache${h4}`]) {
-  try {
-    fs.mkdirSync(dir, { recursive: true });
-    fs.accessSync(dir, fs.constants.R_OK | fs.constants.W_OK);
-    WORK_DIR = dir; break;
-  } catch (e) { console.error(`[DIR] Cannot access ${dir}: ${e.message}`); }
+  try { fs.mkdirSync(dir, { recursive: true }); fs.accessSync(dir, fs.constants.R_OK | fs.constants.W_OK); WORK_DIR = dir; break; }
+  catch (e) { console.error(`[DIR] Cannot access ${dir}: ${e.message}`); }
 }
 if (!WORK_DIR) process.exit(1);
 console.log(`[DIR] Work directory: ${WORK_DIR}`);
 process.chdir(WORK_DIR);
-
-const ARCH = { x64: 'amd64', arm64: 'arm64' }[process.arch];
-if (!ARCH) { console.error(`[ARCH] Unsupported architecture: ${process.arch}`); process.exit(1); }
+if (!ARCH) die(`[ARCH] Unsupported architecture: ${process.arch}`);
 
 // ========== 通用函数 ==========
+function die(msg) { console.error(msg); process.exit(1); }
 function readLog(file) { try { return fs.readFileSync(file, 'utf8'); } catch { return ''; } }
 function loadEnv(file) {
   try { return process.loadEnvFile(file); } catch (e) { if (e.code === 'ENOENT') return; }
@@ -99,19 +96,18 @@ function rewriteConfigToEnvReads() {
 const toB64 = (d) => Buffer.from(d).toString('base64');
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const validPort = (v) => /^\d+$/.test(v) && +v >= 1 && +v <= 65535;
-const die = (msg) => { console.error(`[MODE] ${msg}`); process.exit(1); };
 const nonEmpty = (f) => { try { return fs.statSync(f).size > 0; } catch { return false; } };
 const urlEncode = (t) => encodeURIComponent(t).replace(/[!'()*]/g, (c) => `%${c.charCodeAt(0).toString(16).toUpperCase()}`);
 
 // HTTPS 请求：跟随重定向；传 file 则写入文件，否则返回 { status, body }
-function request(url, { family, timeout = 10000, file = null, redirects = 5 } = {}) {
+function request(url, { family, timeout = 10000, file, redirects = 5 } = {}) {
   return new Promise((resolve, reject) => {
     const r = https.get(url, { family }, (res) => {
       const { statusCode: status, headers } = res;
       if ([301, 302, 303, 307, 308].includes(status) && headers.location) {
         res.resume();
-        if (redirects <= 0) return reject(new Error('too many redirects'));
-        return request(new URL(headers.location, url).href, { family, timeout, file, redirects: redirects - 1 }).then(resolve, reject);
+        return redirects <= 0 ? reject(new Error('too many redirects'))
+          : request(new URL(headers.location, url).href, { family, timeout, file, redirects: redirects - 1 }).then(resolve, reject);
       }
       if (file) {
         if (status >= 400) { res.resume(); return reject(new Error(`HTTP ${status}`)); }
@@ -129,7 +125,8 @@ function request(url, { family, timeout = 10000, file = null, redirects = 5 } = 
 async function download(dest, url) {
   let err;
   for (let i = 0; i < 3; i++) {
-    try { await request(url, { file: `${dest}.part` }); fs.renameSync(`${dest}.part`, dest); return true; } catch (e) { err = e; fs.rmSync(`${dest}.part`, { force: true }); await sleep(1000); }
+    try { await request(url, { file: `${dest}.part` }); fs.renameSync(`${dest}.part`, dest); return true; }
+    catch (e) { err = e; fs.rmSync(`${dest}.part`, { force: true }); await sleep(1000); }
   }
   console.error(`[DL] Download failed: ${url} (${err?.code ?? ''} ${err?.message ?? 'unknown error'})`);
   return false;
@@ -155,8 +152,8 @@ async function unzip(zipFile, dir) {
       fs.mkdirSync(path.dirname(entry), { recursive: true });
       if (!csize) { fs.writeFileSync(entry, ''); continue; }
       const local = readAt(30, offset), start = offset + 30 + local.readUInt16LE(26) + local.readUInt16LE(28);
-      const src = fs.createReadStream(zipFile, { start, end: start + csize - 1 });
-      await pipeline(src, ...(method === 0 ? [] : [zlib.createInflateRaw()]), fs.createWriteStream(entry));
+      await pipeline(fs.createReadStream(zipFile, { start, end: start + csize - 1 }),
+        ...(method === 0 ? [] : [zlib.createInflateRaw()]), fs.createWriteStream(entry));
     }
   } finally { fs.closeSync(fd); }
 }
@@ -207,13 +204,13 @@ const ENCODED_NAME = urlEncode(NAME);
 let WEB_DESTINATION = '';
 if (PORT && CERT_HOST) {
   WEB_DESTINATION = `${CERT_HOST}:80`;
-  if (!/^[A-Za-z0-9.-]+:\d{1,5}$/.test(WEB_DESTINATION)) die(`CERT_HOST='${CERT_HOST}' is invalid (expected a domain or an IPv4 address)`);
+  if (!/^[A-Za-z0-9.-]+:\d{1,5}$/.test(WEB_DESTINATION)) die(`[WEB] CERT_HOST='${CERT_HOST}' is invalid (expected a domain or an IPv4 address)`);
   console.log(`[WEB] Other paths on the front port are forwarded to ${WEB_DESTINATION}`);
 }
 
 const modePort = (name, v, desc) => {
   if (!v) return 0;
-  if (!validPort(v)) die(`${name}='${v}' is invalid (expected a port 1-65535, or empty to disable)`);
+  if (!validPort(v)) die(`[MODE] ${name}='${v}' is invalid (expected a port 1-65535, or empty to disable)`);
   console.log(`[MODE] port ${+v}/${desc}`);
   return +v;
 };
@@ -229,22 +226,22 @@ function parseModes() {
     for (const token of (MODES[protocol] || '').split(',').map((s) => s.trim()).filter(Boolean)) {
       if (token === 'ws' || token === 'cloudflare') {
         const list = token === 'ws' ? WS_PROTOCOLS : CF_PROTOCOLS;
-        if (list.includes(protocol)) die(`${v}: '${token}' is given more than once`);
+        if (list.includes(protocol)) die(`[MODE] ${v}: '${token}' is given more than once`);
         list.push(protocol);
         if (token === 'ws') HAS_WS = true; else HAS_CF = true;
         continue;
       }
-      if (hasReality) die(`${v}: only one Reality entry (a port or a fallback protocol) is allowed`);
+      if (hasReality) die(`[MODE] ${v}: only one Reality entry (a port or a fallback protocol) is allowed`);
       hasReality = true;
       if (/^\d+$/.test(token)) {
-        if (!validPort(token)) die(`${v}='${token}': port must be 1-65535`);
+        if (!validPort(token)) die(`[MODE] ${v}='${token}': port must be 1-65535`);
         NUMERIC_PORT[protocol] = +token;
       } else if (/^[a-z]+$/.test(token)) {
-        if (!PROTOCOLS.includes(token)) die(`${v}='${token}' is not valid`);
-        if (token === protocol) die(`${v}='${token}': a protocol cannot fall back to itself`);
-        if (!['vless', 'trojan'].includes(protocol)) die(`${v}='${token}': only VLESS and TROJAN can choose a fallback`);
+        if (!PROTOCOLS.includes(token)) die(`[MODE] ${v}='${token}' is not valid`);
+        if (token === protocol) die(`[MODE] ${v}='${token}': a protocol cannot fall back to itself`);
+        if (!['vless', 'trojan'].includes(protocol)) die(`[MODE] ${v}='${token}': only VLESS and TROJAN can choose a fallback`);
         FALLBACK[protocol] = token;
-      } else die(`${v}='${token}' is invalid`);
+      } else die(`[MODE] ${v}='${token}' is invalid`);
     }
   }
   QUICK_TUNNEL = HAS_CF && CLOUDFLARE_TUNNEL_TOKEN === 'try';
@@ -262,7 +259,7 @@ function buildChains() {
     }
   }
   for (const [p, t] of Object.entries(FALLBACK)) {
-    if (FALLBACK_PARENT[t]) die(`${t.toUpperCase()} is the fallback of both ${FALLBACK_PARENT[t].toUpperCase()} and ${p.toUpperCase()}, it can only have one`);
+    if (FALLBACK_PARENT[t]) die(`[MODE] ${t.toUpperCase()} is the fallback of both ${FALLBACK_PARENT[t].toUpperCase()} and ${p.toUpperCase()}, it can only have one`);
     FALLBACK_PARENT[t] = p;
   }
   for (const p of PROTOCOLS) {
@@ -278,7 +275,7 @@ function buildChains() {
     for (const p of CHAIN[head]) REALITY_PORT[p] = HEAD_PORT[head];
   }
   XRAY_ON = ENABLED.length > 0 || !!(HYSTERIA2_PORT || MIXED_PORT || WIREGUARD_PORT);
-  for (const p of ENABLED) if ((NUMERIC_PORT[p] || FALLBACK[p] || FALLBACK_PARENT[p]) && !REALITY_PORT[p]) die(`${p.toUpperCase()} is part of a fallback loop`);
+  for (const p of ENABLED) if ((NUMERIC_PORT[p] || FALLBACK[p] || FALLBACK_PARENT[p]) && !REALITY_PORT[p]) die(`[MODE] ${p.toUpperCase()} is part of a fallback loop`);
 }
 
 // 3. 前置入口规划
@@ -286,7 +283,7 @@ function planFront() {
   WS_FRONT_ON = HAS_WS || (!!PORT && !HAS_CF);
   CF_FRONT_ON = HAS_CF;
   if (WS_FRONT_ON) {
-    if (PORT && !validPort(PORT)) die(`PORT='${PORT}' is not a valid port`);
+    if (PORT && !validPort(PORT)) die(`[MODE] PORT='${PORT}' is not a valid port`);
     FRONT_PORT = +(PORT || DEFAULT_FRONT_PORT);
     if (PORT && CHAIN_HEADS.some((h) => HEAD_PORT[h] === FRONT_PORT)) SHARE_FRONT = true;
   }
@@ -299,9 +296,9 @@ function checkPorts() {
   if (CF_FRONT_ON && CF_PORT) ports.push(CF_PORT);
   if (MIXED_PORT) ports.push(MIXED_PORT);
   const dup = ports.find((p, i) => ports.indexOf(p) !== i);
-  if (dup !== undefined) die(`Port ${dup} is used more than once`);
+  if (dup !== undefined) die(`[MODE] Port ${dup} is used more than once`);
   const bad = ports.find((p) => p === SS_PORT || p === SS_WS_PORT);
-  if (bad !== undefined) die(`Port ${bad} conflicts with the internal ports 40004 / 40005 used by Shadowsocks`);
+  if (bad !== undefined) die(`[MODE] Port ${bad} conflicts with the internal ports 40004 / 40005 used by Shadowsocks`);
 }
 
 // ========== TLS 证书 ==========
@@ -325,8 +322,9 @@ function generateSelfSignedCert(cn) {
 function verifyChain(certs, host) {
   if (!certs[0].checkHost(host)) return 'hostname mismatch';
   const roots = (tls.getCACertificates ? tls.getCACertificates('default') : tls.rootCertificates).map((p) => new X509Certificate(p));
-  const valid = (c) => Date.now() >= Date.parse(c.validFrom) && Date.now() <= Date.parse(c.validTo);
-  const signedBy = (c, issuer) => c.checkIssued(issuer) && c.verify(issuer.publicKey);
+  const now = Date.now();
+  const valid = (c) => now >= Date.parse(c.validFrom) && now <= Date.parse(c.validTo);
+  const signedBy = (c, i) => c.checkIssued(i) && c.verify(i.publicKey);
   let cur = certs[0];
   for (let depth = 0; depth < 8; depth++) {
     if (!valid(cur)) return 'certificate expired or not yet valid';
@@ -432,9 +430,7 @@ function buildConfig() {
     const [listen, port] = SHARE_FRONT ? [FRONT_SOCKET, undefined] : ['::', FRONT_PORT];
     inbounds.push(inbound('front-in', listen, port, 'vless', protocolSettings('vless', frontFallbacks(WS_PROTOCOLS)), FRONT_TLS ? streamTls('tcp', 'http/1.1') : streamTcp()));
   }
-  if (CF_FRONT_ON) {
-    inbounds.push(inbound('cf-front-in', '::', CF_PORT, 'vless', protocolSettings('vless', frontFallbacks(CF_PROTOCOLS)), streamTcp()));
-  }
+  if (CF_FRONT_ON) inbounds.push(inbound('cf-front-in', '::', CF_PORT, 'vless', protocolSettings('vless', frontFallbacks(CF_PROTOCOLS)), streamTcp()));
   for (const head of CHAIN_HEADS) {
     for (const p of CHAIN[head]) {
       const fallbacks = FALLBACK[p] ? [{ dest: internalEndpoint(FALLBACK[p]).dest, xver: 0 }] : undefined;
@@ -502,7 +498,7 @@ function wsLink(p, w, name) {
     }))}`;
     case 'shadowsocks': {
       if (w.mode === 'ws' && TLS_INSECURE) {
-        console.error(`[MODE] ws mode: Shadowsocks (v2ray-plugin) needs a trusted certificate, no SS link generated`);
+        console.error('[MODE] ws mode: Shadowsocks (v2ray-plugin) needs a trusted certificate, no SS link generated');
         return '';
       }
       const plugin = `v2ray-plugin;tls;host=${w.host};path=${wsPath};mux=0`.replace(/;/g, '%3B').replace(/=/g, '%3D').replace(/\//g, '%2F');
@@ -620,7 +616,7 @@ async function main() {
   VLESS_FLOW = CHAIN_HEADS.includes('vless') ? 'xtls-rprx-vision' : '';
 
   const KOMARI_ON = !!(KOMARI_ENDPOINT && KOMARI_TOKEN);
-  if (!XRAY_ON && !KOMARI_ON) die('Nothing to run: set a protocol *_MODE / HYSTERIA2_MODE / MIXED_MODE / WIREGUARD_MODE, or KOMARI_ENDPOINT + KOMARI_TOKEN');
+  if (!XRAY_ON && !KOMARI_ON) die('[MODE] Nothing to run: set a protocol *_MODE / HYSTERIA2_MODE / MIXED_MODE / WIREGUARD_MODE, or KOMARI_ENDPOINT + KOMARI_TOKEN');
   if (KOMARI_ON) await startKomari();
 
   if (CHAIN_HEADS.length) {
@@ -639,7 +635,7 @@ async function main() {
   console.log(IPV6_AVAILABLE ? '[NET] IPv6 egress: available' : '[NET] IPv6 egress: unavailable, blocking IPv6 destinations');
   if (FRONT_TLS || HYSTERIA2_PORT) setupTls();
   if (HAS_CF) {
-    if (!CLOUDFLARE_TUNNEL_TOKEN) die('cloudflare mode needs CLOUDFLARE_TUNNEL_TOKEN (a tunnel token, or try for a quick tunnel)');
+    if (!CLOUDFLARE_TUNNEL_TOKEN) die('[CF] cloudflare mode needs CLOUDFLARE_TUNNEL_TOKEN (a tunnel token, or try for a quick tunnel)');
     await startCloudflared();
   }
 
