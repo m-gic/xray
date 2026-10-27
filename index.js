@@ -13,30 +13,30 @@ const getEnv = (key, def = '') => (process.env[key] ?? def).trim();
 const getEnvMode = (key, def = '') => getEnv(key, def).toLowerCase();
 
 // ========== 用户配置(优先级：环境变量 > 同目录 .env > 默认值) ==========
-// 模式写法：ws / xhttp / 端口号 / 回落协议，多个用逗号分隔。配置了 CLOUDFLARE_TUNNEL_TOKEN 时 ws 与 xhttp 走 Cloudflare Tunnel
+// VLESS_MODE 写法：xhttp / 端口号(Reality)，多个用逗号分隔。配置了 CLOUDFLARE_TUNNEL_TOKEN 时 xhttp 走 Cloudflare Tunnel
 const CONFIG = {
-  NAME: getEnv('NAME'),
-  UUID: getEnv('UUID'),
-  CLOUDFLARE_TUNNEL_TOKEN: getEnv('CLOUDFLARE_TUNNEL_TOKEN'),
+  NAME: getEnv('NAME', ''),
+  UUID: getEnv('UUID', ''),
+  CLOUDFLARE_TUNNEL_TOKEN: getEnv('CLOUDFLARE_TUNNEL_TOKEN', ''),
   CLOUDFLARE_IP: getEnv('CLOUDFLARE_IP', 'www.gov.tw'),
-  PORT: getEnv('PORT'),
-  CERT_HOST: getEnv('CERT_HOST'),
-  VLESS_MODE: getEnvMode('VLESS_MODE', 'trojan'),
-  VMESS_MODE: getEnvMode('VMESS_MODE'),
-  TROJAN_MODE: getEnvMode('TROJAN_MODE', 'vmess'),
-  SHADOWSOCKS_MODE: getEnvMode('SHADOWSOCKS_MODE'),
-  HYSTERIA2_MODE: getEnv('HYSTERIA2_MODE'),
+  PORT: getEnv('PORT', ''),
+  CERT_HOST: getEnv('CERT_HOST', ''),
+  VLESS_MODE: getEnvMode('VLESS_MODE', ''),
+  HYSTERIA2_MODE: getEnv('HYSTERIA2_MODE', ''),
   MIXED_MODE: getEnv('MIXED_MODE'),
   WIREGUARD_MODE: getEnv('WIREGUARD_MODE'),
-  WORK_DIR: getEnv('WORK_DIR'),
-  KOMARI_ENDPOINT: getEnv('KOMARI_ENDPOINT'),
-  KOMARI_TOKEN: getEnv('KOMARI_TOKEN'),
+  WORK_DIR: getEnv('WORK_DIR', './'),
+  KOMARI_ENDPOINT: getEnv('KOMARI_ENDPOINT', ''),
+  KOMARI_TOKEN: getEnv('KOMARI_TOKEN', ''),
   LOG_LEVEL: getEnvMode('LOG_LEVEL', 'warning'),
 };
 normalizeConfig();
-if (CONFIG.LOG_LEVEL !== 'none') persistEnv(ENV_FILE);
-const { NAME, UUID, CLOUDFLARE_TUNNEL_TOKEN, CLOUDFLARE_IP, PORT, VLESS_MODE, VMESS_MODE, TROJAN_MODE, SHADOWSOCKS_MODE,
+const { NAME, UUID, CLOUDFLARE_TUNNEL_TOKEN, CLOUDFLARE_IP, PORT, VLESS_MODE,
   HYSTERIA2_MODE, MIXED_MODE, WIREGUARD_MODE, CERT_HOST, KOMARI_ENDPOINT, KOMARI_TOKEN, LOG_LEVEL } = CONFIG;
+
+for (const k of ['VMESS_MODE', 'TROJAN_MODE', 'SHADOWSOCKS_MODE']) {
+  if (getEnv(k)) console.error(`[MODE] ${k} is no longer supported and is ignored`);
+}
 
 const QUIET = LOG_LEVEL === 'none';
 if (QUIET) console.log = console.error = () => {};
@@ -67,35 +67,16 @@ function loadEnv(f) {
     if (process.env[m[1]] === undefined) process.env[m[1]] = q ? q[2] : raw.replace(/\s+#.*$/, '');
   }
 }
+// UUID 必须由用户提供：自动生成的 UUID 不会保存，每次启动都会变，订阅链接随之失效
 function normalizeConfig() {
-  CONFIG.UUID = CONFIG.UUID || crypto.randomUUID();
+  if (!CONFIG.UUID) {
+    console.error('[CONFIG] UUID is required, set it in the environment or in .env (e.g. node -e "console.log(crypto.randomUUID())")');
+    process.exit(1);
+  }
   CONFIG.PORT = CONFIG.PORT.replace(/^0+$/, '');
   CONFIG.CERT_HOST = CONFIG.CERT_HOST.replace(/^[a-z]+:\/\//i, '').replace(/[/:].*$/, '');
 }
-// 把配置持久化到 .env(权限 600)，并把脚本中的 CONFIG 改为只读环境变量
-function persistEnv(f) {
-  const fmt = (k, v) => `${k}=${/[\s#'"]/.test(v) ? `"${v}"` : v}`;
-  let text = readText(f);
-  for (const [k, v] of Object.entries(CONFIG)) {
-    const re = new RegExp(`^\\s*(?:export\\s+)?${k}\\s*=.*$`, 'm');
-    text = re.test(text) ? text.replace(re, () => fmt(k, v)) : `${text}${text && !text.endsWith('\n') ? '\n' : ''}${fmt(k, v)}\n`;
-  }
-  try { fs.writeFileSync(f, text, { mode: 0o600 }); fs.chmodSync(f, 0o600); }
-  catch (e) { console.error(`[ENV] Cannot write ${f}: ${e.message}`); }
-  rewriteConfigToEnvReads();
-}
-function rewriteConfigToEnvReads() {
-  try {
-    const src = fs.readFileSync(SCRIPT_PATH, 'utf8');
-    const block = src.match(/^const CONFIG = \{\n[\s\S]*?\n\};/m);
-    if (!block) return console.error('[ENV] CONFIG block not found, script not rewritten');
-    const rewritten = block[0].replace(/^  ([A-Z0-9_]+): .*$/gm, (line, k) => (k in CONFIG
-      ? `  ${k}: ${/_MODE$|^LOG_LEVEL$/.test(k) ? 'getEnvMode' : 'getEnv'}('${k}'),` : line));
-    fs.writeFileSync(SCRIPT_PATH, src.replace(block[0], () => rewritten));
-  } catch (e) { console.error(`[ENV] Cannot rewrite script: ${e.message}`); }
-}
 
-const toBase64 = (d) => Buffer.from(d).toString('base64');
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const validPort = (v) => /^\d+$/.test(v) && +v >= 1 && +v <= 65535;
 const nonEmpty = (f) => { try { return fs.statSync(f).size > 0; } catch { return false; } };
@@ -189,31 +170,17 @@ function spawnBackground(bin, args, logFile, env = {}) {
   return child;
 }
 
-// ========== 协议与模式 ==========
-const PROTOCOLS = ['vless', 'vmess', 'trojan', 'shadowsocks'];
-const WS_PATH = Object.fromEntries(PROTOCOLS.map((p) => [p, `/${UUID}-${p === 'shadowsocks' ? 'ss' : p}`]));
-const XHTTP_PATH = Object.fromEntries(PROTOCOLS.map((p) => [p, `/${UUID}-${p}-xhttp`]));
-const SS_PORT = 40004, SS_WS_PORT = 40005;
+// ========== 协议与模式(仅保留 VLESS: xhttp / Reality) ==========
+const XHTTP_PATH = `/${UUID}-vless-xhttp`;
 const abstractSock = (name) => `@xray-${crypto.createHash('sha1').update(BASE_DIR).digest('hex').slice(0, 8)}-${name}`;
-const endpoint = (p, name, ssPort) => (p === 'shadowsocks'
-  ? { listen: '127.0.0.1', port: ssPort, dest: ssPort }
-  : { listen: abstractSock(name), dest: abstractSock(name) });
-const internalEp = (p) => endpoint(p, p, SS_PORT);
-const wsEp = (p) => endpoint(p, `${p}-ws`, SS_WS_PORT);
-const xhttpEp = (p) => endpoint(p, `${p}-xhttp`);
-const FRONT_SOCKET = abstractSock('front'), WEB_SOCKET = abstractSock('web');
-const DEFAULT_FRONT_PORT = 8000, WG_CLIENT_ADDR = '10.0.0.2/32';
-const MODES = { vless: VLESS_MODE, vmess: VMESS_MODE, trojan: TROJAN_MODE, shadowsocks: SHADOWSOCKS_MODE };
-const NUMERIC_PORT = {}, FALLBACK = {}, FALLBACK_PARENT = {}, CHAIN = {}, HEAD_PORT = {}, REALITY_PORT = {};
-const ENABLED = [], WS_PROTOCOLS = [], XHTTP_PROTOCOLS = [], CHAIN_HEADS = [];
-const FRONT_PROTOCOLS = () => [...new Set([...WS_PROTOCOLS, ...XHTTP_PROTOCOLS])];
-const frontSummary = () => [['ws', WS_PROTOCOLS], ['xhttp', XHTTP_PROTOCOLS]]
-  .filter(([, l]) => l.length).map(([n, l]) => `${n} (${l.join(' ')})`).join(', ');
-let QUICK_TUNNEL = false, FRONT_ON = false, CF_ON = false, SHARE_FRONT = false, FRONT_TLS = false;
+const XHTTP_SOCKET = abstractSock('vless-xhttp'), FRONT_SOCKET = abstractSock('front'), WEB_SOCKET = abstractSock('web');
+const QUICK_TUNNEL_PORT = 8000, WG_CLIENT_ADDR = '10.0.0.2/32';
+let XHTTP_ON = false, REALITY_PORT = 0;
+let FRONT_ON = false, CF_ON = false, SHARE_FRONT = false, FRONT_TLS = false;
 let FRONT_PORT = 0, CF_PORT = 0, XRAY_ON = false;
 const ENCODED_NAME = urlEncode(NAME);
 
-// 前置入口的非 ws/xhttp 请求回落到内置 HTTP 服务
+// 前置入口的非 xhttp 请求回落到内置 HTTP 服务
 let WEB_DESTINATION = '';
 if (PORT && CERT_HOST) {
   WEB_DESTINATION = `${CERT_HOST}:80`;
@@ -231,92 +198,51 @@ const HYSTERIA2_PORT = modePort('HYSTERIA2_MODE', HYSTERIA2_MODE, 'udp: hysteria
 const MIXED_PORT = modePort('MIXED_MODE', MIXED_MODE, 'tcp: mixed (socks5 + http)');
 const WIREGUARD_PORT = modePort('WIREGUARD_MODE', WIREGUARD_MODE, 'udp: wireguard');
 
-// 1. 解析各协议的 *_MODE
+// 1. 解析 VLESS_MODE
 function parseModes() {
-  for (const p of PROTOCOLS) {
-    const env = `${p.toUpperCase()}_MODE`;
-    let hasReality = false;
-    for (const t of (MODES[p] || '').split(',').map((s) => s.trim()).filter(Boolean)) {
-      if (t === 'cloudflare') die(`[MODE] ${env}: 'cloudflare' mode was removed, use ws or xhttp together with CLOUDFLARE_TUNNEL_TOKEN`);
-      if (t === 'ws' || t === 'xhttp') {
-        if (t === 'xhttp' && p === 'shadowsocks') die(`[MODE] ${env}: xhttp is not supported for shadowsocks (no common client support)`);
-        const list = t === 'ws' ? WS_PROTOCOLS : XHTTP_PROTOCOLS;
-        if (list.includes(p)) die(`[MODE] ${env}: '${t}' is given more than once`);
-        list.push(p);
-        continue;
-      }
-      if (hasReality) die(`[MODE] ${env}: only one Reality entry (a port or a fallback protocol) is allowed`);
-      hasReality = true;
-      if (/^\d+$/.test(t)) {
-        if (!validPort(t)) die(`[MODE] ${env}='${t}': port must be 1-65535`);
-        NUMERIC_PORT[p] = +t;
-      } else if (/^[a-z]+$/.test(t)) {
-        if (!PROTOCOLS.includes(t)) die(`[MODE] ${env}='${t}' is not valid`);
-        if (t === p) die(`[MODE] ${env}='${t}': a protocol cannot fall back to itself`);
-        if (!['vless', 'trojan'].includes(p)) die(`[MODE] ${env}='${t}': only VLESS and TROJAN can choose a fallback`);
-        FALLBACK[p] = t;
-      } else die(`[MODE] ${env}='${t}' is invalid`);
-    }
+  for (const t of VLESS_MODE.split(',').map((s) => s.trim()).filter(Boolean)) {
+    if (t === 'ws' || t === 'cloudflare') die(`[MODE] VLESS_MODE: '${t}' is no longer supported, use xhttp (with CLOUDFLARE_TUNNEL_TOKEN for Cloudflare Tunnel)`);
+    if (t === 'xhttp') {
+      if (XHTTP_ON) die("[MODE] VLESS_MODE: 'xhttp' is given more than once");
+      XHTTP_ON = true;
+    } else if (/^\d+$/.test(t)) {
+      if (!validPort(t)) die(`[MODE] VLESS_MODE='${t}': port must be 1-65535`);
+      if (REALITY_PORT) die('[MODE] VLESS_MODE: only one Reality port is allowed');
+      REALITY_PORT = +t;
+    } else die(`[MODE] VLESS_MODE='${t}' is invalid (expected xhttp or a port)`);
   }
 }
 
-// 2. 整理回落关系为 Reality 链
-function buildChains() {
-  for (let changed = true; changed;) {
-    changed = false;
-    for (const [p, t] of Object.entries(FALLBACK)) {
-      if (NUMERIC_PORT[t] || FALLBACK[t]) continue;
-      console.log(`[MODE] ${p.toUpperCase()}_MODE='${t}': ${t.toUpperCase()} has no Reality port, so this fallback entry is ignored`);
-      delete FALLBACK[p];
-      changed = true;
-    }
-  }
-  for (const [p, t] of Object.entries(FALLBACK)) {
-    if (FALLBACK_PARENT[t]) die(`[MODE] ${t.toUpperCase()} is the fallback of both ${FALLBACK_PARENT[t].toUpperCase()} and ${p.toUpperCase()}, it can only have one`);
-    FALLBACK_PARENT[t] = p;
-  }
-  for (const p of PROTOCOLS) {
-    const hasReality = !!(NUMERIC_PORT[p] || FALLBACK[p]);
-    if (FRONT_PROTOCOLS().includes(p) || hasReality || FALLBACK_PARENT[p]) ENABLED.push(p);
-    if (hasReality && !FALLBACK_PARENT[p]) CHAIN_HEADS.push(p);
-  }
-  for (const h of CHAIN_HEADS) {
-    let tail = h;
-    CHAIN[h] = [h];
-    while (FALLBACK[tail]) { tail = FALLBACK[tail]; CHAIN[h].push(tail); }
-    HEAD_PORT[h] = NUMERIC_PORT[tail];
-    for (const p of CHAIN[h]) REALITY_PORT[p] = HEAD_PORT[h];
-  }
-  XRAY_ON = ENABLED.length > 0 || !!(HYSTERIA2_PORT || MIXED_PORT || WIREGUARD_PORT);
-  for (const p of ENABLED) {
-    if ((NUMERIC_PORT[p] || FALLBACK[p] || FALLBACK_PARENT[p]) && !REALITY_PORT[p]) die(`[MODE] ${p.toUpperCase()} is part of a fallback loop`);
-  }
+// PORT 为空且未配置 CF 隧道时，xhttp 没有入口，直接忽略
+function dropDirectFront() {
+  if (PORT || CLOUDFLARE_TUNNEL_TOKEN || !XHTTP_ON) return;
+  console.log('[MODE] PORT is empty: xhttp is disabled (set PORT, or CLOUDFLARE_TUNNEL_TOKEN)');
+  XHTTP_ON = false;
 }
 
-// 3. 前置入口规划：配置了 Cloudflare token 且有 ws/xhttp 时走隧道，否则直连 PORT
+// 2. 前置入口规划：配置了 Cloudflare token 且启用 xhttp 时走隧道，否则只有设置了 PORT 才启用前置入口
 function planFront() {
-  CF_ON = !!CLOUDFLARE_TUNNEL_TOKEN && FRONT_PROTOCOLS().length > 0;
-  FRONT_ON = CF_ON || FRONT_PROTOCOLS().length > 0 || !!PORT;
+  CF_ON = !!CLOUDFLARE_TUNNEL_TOKEN && XHTTP_ON;
+  FRONT_ON = CF_ON || !!PORT;
   if (CF_ON) {
-    if (PORT) console.log('[MODE] PORT is ignored: ws/xhttp are served through the Cloudflare Tunnel');
+    if (PORT) console.log('[MODE] PORT is ignored: xhttp is served through the Cloudflare Tunnel');
     return;
   }
   if (!FRONT_ON) return;
-  if (PORT && !validPort(PORT)) die(`[MODE] PORT='${PORT}' is not a valid port`);
-  FRONT_PORT = +(PORT || DEFAULT_FRONT_PORT);
-  if (PORT && CHAIN_HEADS.some((h) => HEAD_PORT[h] === FRONT_PORT)) SHARE_FRONT = true;
+  if (!validPort(PORT)) die(`[MODE] PORT='${PORT}' is not a valid port`);
+  FRONT_PORT = +PORT;
+  if (REALITY_PORT && REALITY_PORT === FRONT_PORT) SHARE_FRONT = true;
 }
 
-// 4. 端口检查
+// 3. 端口检查
 function checkPorts() {
-  const used = CHAIN_HEADS.map((h) => HEAD_PORT[h]);
+  const used = [];
+  if (REALITY_PORT) used.push(REALITY_PORT);
   if (FRONT_ON && !CF_ON && !SHARE_FRONT) used.push(FRONT_PORT);
   if (CF_ON && CF_PORT) used.push(CF_PORT);
   if (MIXED_PORT) used.push(MIXED_PORT);
   const dup = used.find((p, i) => used.indexOf(p) !== i);
   if (dup !== undefined) die(`[MODE] Port ${dup} is used more than once`);
-  const conflict = used.find((p) => p === SS_PORT || p === SS_WS_PORT);
-  if (conflict !== undefined) die(`[MODE] Port ${conflict} conflicts with the internal ports 40004 / 40005 used by Shadowsocks`);
 }
 
 // ========== TLS 证书 ==========
@@ -419,7 +345,6 @@ let WG_SERVER_PRIV = '', WG_SERVER_PUB = '', WG_CLIENT_PRIV = '', WG_CLIENT_PUB 
 const SNIFFING = { enabled: true, destOverride: ['http', 'tls', 'quic'], routeOnly: true };
 
 const streamTcp = () => ({ network: 'tcp', security: 'none' });
-const streamWs = (p) => ({ network: 'ws', security: 'none', wsSettings: { path: p } });
 const streamXhttp = (p) => ({ network: 'xhttp', security: 'none', xhttpSettings: { path: p, mode: 'auto' } });
 const streamReality = (dest = 'www.iij.ad.jp:443', serverName = 'www.iij.ad.jp') => ({
   network: 'tcp', security: 'reality',
@@ -432,47 +357,25 @@ const streamTls = (network, alpn, extra = {}) => ({
 });
 const inbound = (tag, listen, port, protocol, settings, streamSettings) => ({ tag, listen, port, protocol, settings, streamSettings, sniffing: SNIFFING });
 
-function protocolSettings(p, fallbacks, flow) {
-  const fb = fallbacks ? { fallbacks } : {};
-  switch (p) {
-    case 'vless': return { clients: [{ id: UUID, email: UUID, ...(flow ? { flow } : {}) }], decryption: 'none', ...fb };
-    case 'vmess': return { clients: [{ id: UUID, email: UUID }] };
-    case 'trojan': return { clients: [{ password: UUID, email: UUID }], ...fb };
-    case 'shadowsocks': return { method: 'aes-256-gcm', password: UUID, network: 'tcp' };
-  }
-}
+const vlessSettings = (fallbacks, flow) => ({
+  clients: [{ id: UUID, email: UUID, ...(flow ? { flow } : {}) }], decryption: 'none', ...(fallbacks ? { fallbacks } : {}),
+});
 
 function buildConfig() {
   const inbounds = [];
-  for (const p of WS_PROTOCOLS) {
-    const e = wsEp(p);
-    inbounds.push(inbound(`${p}-ws-in`, e.listen, e.port, p, protocolSettings(p), streamWs(WS_PATH[p])));
-  }
-  for (const p of XHTTP_PROTOCOLS) {
-    const e = xhttpEp(p);
-    inbounds.push(inbound(`${p}-xhttp-in`, e.listen, undefined, p, protocolSettings(p), streamXhttp(XHTTP_PATH[p])));
-  }
+  if (XHTTP_ON) inbounds.push(inbound('vless-xhttp-in', XHTTP_SOCKET, undefined, 'vless', vlessSettings(), streamXhttp(XHTTP_PATH)));
   if (FRONT_ON) {
     const frontFallbacks = [
-      ...WS_PROTOCOLS.map((p) => ({ path: WS_PATH[p], dest: wsEp(p).dest, xver: 0 })),
-      ...XHTTP_PROTOCOLS.map((p) => ({ path: XHTTP_PATH[p], dest: xhttpEp(p).dest, xver: 0 })),
+      ...(XHTTP_ON ? [{ path: XHTTP_PATH, dest: XHTTP_SOCKET, xver: 0 }] : []),
       { dest: WEB_SOCKET, xver: 0 },
     ];
     const [listen, port] = CF_ON ? ['::', CF_PORT] : (SHARE_FRONT ? [FRONT_SOCKET, undefined] : ['::', FRONT_PORT]);
-    inbounds.push(inbound('front-in', listen, port, 'vless', protocolSettings('vless', frontFallbacks),
+    inbounds.push(inbound('front-in', listen, port, 'vless', vlessSettings(frontFallbacks),
       FRONT_TLS ? streamTls('tcp', 'http/1.1') : streamTcp()));
   }
-  for (const head of CHAIN_HEADS) {
-    for (const p of CHAIN[head]) {
-      const fallbacks = FALLBACK[p] ? [{ dest: internalEp(FALLBACK[p]).dest, xver: 0 }] : undefined;
-      if (p !== head) {
-        const e = internalEp(p);
-        inbounds.push(inbound(`${p}-in`, e.listen, e.port, p, protocolSettings(p, fallbacks), streamTcp()));
-        continue;
-      }
-      const stream = SHARE_FRONT && HEAD_PORT[head] === FRONT_PORT ? streamReality(FRONT_SOCKET, TLS_SERVER_NAME) : streamReality();
-      inbounds.push(inbound(`${p}-in`, '::', HEAD_PORT[head], p, protocolSettings(p, fallbacks, p === 'vless' ? VLESS_FLOW : ''), stream));
-    }
+  if (REALITY_PORT) {
+    const stream = SHARE_FRONT ? streamReality(FRONT_SOCKET, TLS_SERVER_NAME) : streamReality();
+    inbounds.push(inbound('vless-in', '::', REALITY_PORT, 'vless', vlessSettings(undefined, VLESS_FLOW), stream));
   }
   if (HYSTERIA2_PORT) inbounds.push(inbound('hysteria2-in', '::', HYSTERIA2_PORT, 'hysteria',
     { version: 2, clients: [{ auth: UUID, email: UUID }] }, streamTls('hysteria', 'h3', { hysteriaSettings: { version: 2 } })));
@@ -501,61 +404,31 @@ function buildConfig() {
 }
 
 // ========== 订阅链接 ==========
-let SS_USERINFO = '', CF_HOSTNAME = '';
+let CF_HOSTNAME = '';
 
-function realityLink(p, port, name) {
-  const sni = SHARE_FRONT && port === FRONT_PORT ? TLS_SERVER_NAME : 'www.iij.ad.jp';
-  const enc = p === 'vless' ? `encryption=none${VLESS_FLOW ? `&flow=${VLESS_FLOW}` : ''}&` : p === 'vmess' ? 'encryption=auto&' : '';
-  const q = `security=reality&sni=${sni}&fp=chrome&pbk=${REALITY_PUBLIC_KEY}&type=tcp&sid=${REALITY_SHORT_ID}`;
-  const isSs = p === 'shadowsocks';
-  return `${isSs ? 'ss' : p}://${isSs ? SS_USERINFO : UUID}@${PUBLIC_ADDRESS}:${port}?${enc}${q}#${urlEncode(name)}`;
+function realityLink() {
+  const sni = SHARE_FRONT ? TLS_SERVER_NAME : 'www.iij.ad.jp';
+  const flow = VLESS_FLOW ? `&flow=${VLESS_FLOW}` : '';
+  return `vless://${UUID}@${PUBLIC_ADDRESS}:${REALITY_PORT}?encryption=none${flow}&security=reality&sni=${sni}&fp=chrome&pbk=${REALITY_PUBLIC_KEY}&type=tcp&sid=${REALITY_SHORT_ID}#${ENCODED_NAME}`;
 }
 
 // 前置入口的连接参数：走 Cloudflare Tunnel 时用 CF 域名 443，否则用直连地址
 function frontParams() {
-  if (CF_ON) return { viaCf: true, address: CLOUDFLARE_IP || CF_HOSTNAME, port: 443, host: CF_HOSTNAME, insecure: 0, pinned: '', extra: null, query: '' };
-  const insecure = TLS_INSECURE ? 1 : 0;
+  if (CF_ON) return { address: CLOUDFLARE_IP || CF_HOSTNAME, port: 443, host: CF_HOSTNAME, query: '' };
   return {
-    viaCf: false, address: PUBLIC_ADDRESS, port: FRONT_PORT, host: TLS_SERVER_NAME, insecure, pinned: TLS_PINNED_CERT_SHA256,
-    extra: { allowInsecure: insecure, verify_cert: !TLS_INSECURE },
+    address: PUBLIC_ADDRESS, port: FRONT_PORT, host: TLS_SERVER_NAME,
     query: TLS_INSECURE ? `&allowInsecure=1&pcs=${TLS_PINNED_CERT_SHA256}` : '',
   };
 }
 
-const frontTransports = (p) => [...(WS_PROTOCOLS.includes(p) ? ['ws'] : []), ...(XHTTP_PROTOCOLS.includes(p) ? ['xhttp'] : [])];
-
-function frontLink(p, transport, params, name) {
-  const linkPath = transport === 'xhttp' ? XHTTP_PATH[p] : WS_PATH[p];
-  const encName = urlEncode(name);
-  const query = `sni=${params.host}&fp=chrome&type=${transport}&host=${params.host}&path=${urlEncode(linkPath)}${transport === 'xhttp' ? '&mode=auto' : ''}${params.query}#${encName}`;
-  switch (p) {
-    case 'vless': return `vless://${UUID}@${params.address}:${params.port}?encryption=none&security=tls&${query}`;
-    case 'trojan': return `trojan://${UUID}@${params.address}:${params.port}?security=tls&${query}`;
-    case 'vmess': return `vmess://${toBase64(JSON.stringify({
-      v: '2', ps: name, add: params.address, port: String(params.port), id: UUID, aid: '0', scy: 'none', net: transport, type: 'none',
-      host: params.host, path: linkPath + (params.viaCf && transport === 'ws' ? '?ed=2560' : ''), tls: 'tls', sni: params.host, alpn: '', fp: '',
-      insecure: String(params.insecure), ...(params.extra || {}), vcn: '', pcs: params.pinned,
-    }))}`;
-    case 'shadowsocks': {
-      if (TLS_INSECURE && !params.viaCf) {
-        console.error('[MODE] ws mode: Shadowsocks (v2ray-plugin) needs a trusted certificate, no SS link generated');
-        return '';
-      }
-      const plugin = `v2ray-plugin;tls;host=${params.host};path=${linkPath};mux=0`.replace(/;/g, '%3B').replace(/=/g, '%3D').replace(/\//g, '%2F');
-      return `ss://${SS_USERINFO}@${params.address}:${params.port}/?plugin=${plugin}#${encName}`;
-    }
-  }
+function frontLink(params, name) {
+  const query = `sni=${params.host}&fp=chrome&type=xhttp&host=${params.host}&path=${urlEncode(XHTTP_PATH)}&mode=auto${params.query}#${urlEncode(name)}`;
+  return `vless://${UUID}@${params.address}:${params.port}?encryption=none&security=tls&${query}`;
 }
 
-const realityNodes = () => ENABLED.filter((p) => REALITY_PORT[p]).map((p) => realityLink(p, REALITY_PORT[p], NAME));
-
 function frontNodes() {
-  if (!FRONT_PROTOCOLS().length || (CF_ON && !CF_HOSTNAME)) return [];
-  const params = frontParams();
-  return ENABLED.flatMap((p) => {
-    const ts = frontTransports(p);
-    return ts.map((t) => frontLink(p, t, params, (REALITY_PORT[p] || ts.length > 1) ? `${NAME}-${t}` : NAME));
-  });
+  if (!XHTTP_ON || (CF_ON && !CF_HOSTNAME)) return [];
+  return [frontLink(frontParams(), REALITY_PORT ? `${NAME}-xhttp` : NAME)];
 }
 
 const hysteria2Link = () => `hysteria2://${UUID}@${PUBLIC_ADDRESS}:${HYSTERIA2_PORT}/?sni=${TLS_SERVER_NAME}${TLS_INSECURE ? '&insecure=1' : ''}#${ENCODED_NAME}`;
@@ -569,12 +442,10 @@ const upstreamAgent = new http.Agent({ keepAlive: true, keepAliveMsecs: 30000, m
 
 function startWeb(subscriptionBody) {
   const [destHost, destPort] = WEB_DESTINATION.split(':');
-  const xhttpRoutes = Object.entries(XHTTP_PATH).map(([p, prefix]) => ({
-    prefix, socketPath: `\0${xhttpEp(p).listen.slice(1)}`,
-  }));
+  const xhttpSocketPath = `\0${XHTTP_SOCKET.slice(1)}`;
   http.createServer((req, res) => {
     const pathname = req.url.split('?')[0];
-    const route = xhttpRoutes.find(({ prefix }) => pathname === prefix || pathname.startsWith(`${prefix}/`));
+    const isXhttp = XHTTP_ON && (pathname === XHTTP_PATH || pathname.startsWith(`${XHTTP_PATH}/`));
     const forward = (opts) => {
       const up = http.request({ ...opts, path: req.url, method: req.method, headers: req.headers, agent: upstreamAgent }, (ur) => {
         res.writeHead(ur.statusCode, ur.headers);
@@ -583,9 +454,8 @@ function startWeb(subscriptionBody) {
       up.on('error', () => { if (!res.headersSent) res.writeHead(502); res.end(); });
       req.pipe(up);
     };
-    if (route) return forward({ socketPath: route.socketPath });
+    if (isXhttp) return forward({ socketPath: xhttpSocketPath });
 
-    console.log(`[WEB] ${req.method} ${pathname === `/${UUID}` ? '/UUID' : pathname}`);
     if ((req.method === 'GET' || req.method === 'HEAD') && pathname === `/${UUID}`) {
       res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8', 'Cache-Control': 'no-store' });
       return res.end(req.method === 'HEAD' ? undefined : subscriptionBody);
@@ -638,11 +508,10 @@ async function startCloudflared() {
   await killPrevious(svc, 'CF');
   const bin = await fetchBinary(svc, `https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${ARCH}`);
   const logFile = path.join(WORK_DIR, `${svc}.log`);
-  const fail = (msg) => { console.error(`[CF] ${msg}`); process.exit(1); };
   cp.spawnSync(bin, ['--version'], { stdio: STDIO });
 
-  if (QUICK_TUNNEL) {
-    CF_PORT = DEFAULT_FRONT_PORT;
+  if (CLOUDFLARE_TUNNEL_TOKEN === 'try') {
+    CF_PORT = QUICK_TUNNEL_PORT;
     checkPorts();
     spawnBackground(bin, ['--no-autoupdate', 'tunnel', '--url', `http://localhost:${CF_PORT}`], logFile);
     for (let i = 0; i < 30 && !CF_HOSTNAME; i++) {
@@ -650,13 +519,13 @@ async function startCloudflared() {
         .map((m) => m[1]).find((h) => !h.startsWith('api.')) || '';
       if (!CF_HOSTNAME) await sleep(1000);
     }
-    if (!CF_HOSTNAME) fail(`Cannot find the trycloudflare.com hostname in ${logFile}, exiting`);
+    if (!CF_HOSTNAME) die(`[CF] Cannot find the trycloudflare.com hostname in ${logFile}, exiting`);
     console.log(`[CF] Quick tunnel hostname: ${CF_HOSTNAME} (service port=${CF_PORT})`);
   } else {
     spawnBackground(bin, ['--no-autoupdate', 'tunnel', 'run'], logFile, { TUNNEL_TOKEN: CLOUDFLARE_TUNNEL_TOKEN });
     for (let i = 0; i < 30 && !readText(logFile).includes('Updated to new configuration'); i++) await sleep(1000);
     const rule = parseIngress(readText(logFile));
-    if (!rule || !validPort(rule.port)) fail(`Cannot read hostname / port from ${logFile} (needs a Public hostname without * and a Service like http://localhost:PORT), exiting`);
+    if (!rule || !validPort(rule.port)) die(`[CF] Cannot read hostname / port from ${logFile} (needs a Public hostname without * and a Service like http://localhost:PORT), exiting`);
     CF_HOSTNAME = rule.hostname;
     CF_PORT = +rule.port;
     checkPorts();
@@ -668,23 +537,23 @@ async function startCloudflared() {
 // ========== 主流程 ==========
 async function main() {
   parseModes();
-  buildChains();
+  dropDirectFront();
+  XRAY_ON = XHTTP_ON || !!REALITY_PORT || !!(HYSTERIA2_PORT || MIXED_PORT || WIREGUARD_PORT);
   planFront();
-  QUICK_TUNNEL = CF_ON && CLOUDFLARE_TUNNEL_TOKEN === 'try';
-  FRONT_TLS = !CF_ON && (FRONT_PROTOCOLS().length > 0 || SHARE_FRONT);
+  FRONT_TLS = !CF_ON && (XHTTP_ON || SHARE_FRONT);
   checkPorts();
 
-  if (ENABLED.length) console.log(`[MODE] enabled=${ENABLED.join(' ')}`);
-  if (CF_ON) console.log(`[MODE] cloudflare tunnel (${QUICK_TUNNEL ? 'quick' : 'fixed'}): ${frontSummary()} (tunnel port decided by cloudflared log)`);
-  else if (FRONT_ON) console.log(`[MODE] port ${FRONT_PORT}: ${frontSummary() || 'subscription only'}${SHARE_FRONT ? ' shared with reality' : ''}`);
-  for (const h of CHAIN_HEADS) console.log(`[MODE] port ${HEAD_PORT[h]}: reality (${CHAIN[h].join(' -> ')})`);
-  VLESS_FLOW = CHAIN_HEADS.includes('vless') ? 'xtls-rprx-vision' : '';
+  if (XHTTP_ON || REALITY_PORT) console.log(`[MODE] enabled=vless${XHTTP_ON ? ' xhttp' : ''}${REALITY_PORT ? ' reality' : ''}`);
+  if (CF_ON) console.log(`[MODE] cloudflare tunnel (${CLOUDFLARE_TUNNEL_TOKEN === 'try' ? 'quick' : 'fixed'}): xhttp (tunnel port decided by cloudflared log)`);
+  else if (FRONT_ON) console.log(`[MODE] port ${FRONT_PORT}: ${XHTTP_ON ? 'xhttp' : 'subscription only'}${SHARE_FRONT ? ' shared with reality' : ''}`);
+  if (REALITY_PORT) console.log(`[MODE] port ${REALITY_PORT}: reality`);
+  VLESS_FLOW = REALITY_PORT ? 'xtls-rprx-vision' : '';
 
   const KOMARI_ON = !!(KOMARI_ENDPOINT && KOMARI_TOKEN);
-  if (!XRAY_ON && !KOMARI_ON) die('[MODE] Nothing to run: set a protocol *_MODE / HYSTERIA2_MODE / MIXED_MODE / WIREGUARD_MODE, or KOMARI_ENDPOINT + KOMARI_TOKEN');
+  if (!XRAY_ON && !KOMARI_ON) die('[MODE] Nothing to run: set VLESS_MODE / HYSTERIA2_MODE / MIXED_MODE / WIREGUARD_MODE, or KOMARI_ENDPOINT + KOMARI_TOKEN');
   if (KOMARI_ON) await startKomari();
 
-  if (CHAIN_HEADS.length) {
+  if (REALITY_PORT) {
     [REALITY_PRIVATE_KEY, REALITY_PUBLIC_KEY] = deriveKey('reality', 'base64url');
     REALITY_SHORT_ID = crypto.createHash('sha256').update(`reality-short-id:${UUID}`).digest('hex').slice(0, 8);
     console.log(`[REALITY] Private key: ${REALITY_PRIVATE_KEY}\n[REALITY] Public key: ${REALITY_PUBLIC_KEY}\n[REALITY] Short ID: ${REALITY_SHORT_ID}`);
@@ -693,9 +562,8 @@ async function main() {
     [WG_SERVER_PRIV, WG_SERVER_PUB] = deriveKey('wg-server', 'base64');
     [WG_CLIENT_PRIV, WG_CLIENT_PUB] = deriveKey('wg-client', 'base64');
   }
-  SS_USERINFO = Buffer.from(`aes-256-gcm:${UUID}`).toString('base64url');
 
-  if ((FRONT_ON && !CF_ON) || CHAIN_HEADS.length || HYSTERIA2_PORT || MIXED_PORT || WIREGUARD_PORT) await resolvePublicAddress();
+  if ((FRONT_ON && !CF_ON) || REALITY_PORT || HYSTERIA2_PORT || MIXED_PORT || WIREGUARD_PORT) await resolvePublicAddress();
   IPV6_AVAILABLE = await request(TRACE_URL, { family: 6, timeout: 5000 }).then(() => true, () => false);
   console.log(IPV6_AVAILABLE ? '[NET] IPv6 egress: available' : '[NET] IPv6 egress: unavailable, blocking IPv6 destinations');
   if (FRONT_TLS || HYSTERIA2_PORT) setupTls();
@@ -709,11 +577,10 @@ async function main() {
   await unzip(zipFile, WORK_DIR);
   fs.rmSync(zipFile, { force: true });
   try { fs.renameSync(extracted, xrayBin); } catch (e) { console.error(`[XRAY] Cannot rename binary: ${e.message}`); }
-  if (!nonEmpty(xrayBin)) { console.error(`[XRAY] Binary not found after extraction: ${xrayBin}`); process.exit(1); }
+  if (!nonEmpty(xrayBin)) die(`[XRAY] Binary not found after extraction: ${xrayBin}`);
   fs.chmodSync(xrayBin, 0o755);
   const xrayEnv = { ...process.env, ...GO_ENV, XRAY_LOCATION_ASSET: WORK_DIR };
   const runXray = (args) => cp.spawnSync(xrayBin, args, { stdio: STDIO, env: xrayEnv });
-  runXray(['version']);
 
   // 先以 600 权限写入(含 UUID 和 Reality 私钥)，再测试配置
   fs.writeFileSync(configFile, `${JSON.stringify(buildConfig(), null, 2)}\n`, { mode: 0o600 });
@@ -722,17 +589,18 @@ async function main() {
 
   // ---- 订阅输出 ----
   const nodes = [
-    ...realityNodes(),
+    REALITY_PORT && realityLink(),
     ...frontNodes(),
     HYSTERIA2_PORT && hysteria2Link(),
     WIREGUARD_PORT && wireguardLink(),
     MIXED_PORT && mixedLinks(),
   ];
   const allNodes = nodes.filter(Boolean).map((n) => `${n}\n`).join('');
-  console.log(`\n=== Nodes ===\n${allNodes}\n=== Subscription (base64) ===\n${toBase64(allNodes)}\n`);
+  const subscription = Buffer.from(allNodes).toString('base64');
+  console.log(`\n=== Nodes ===\n${allNodes}\n=== Subscription (base64) ===\n${subscription}\n`);
   if (WIREGUARD_PORT) console.log(`\n=== WireGuard config (wg-quick) ===\n${wireguardConfig()}`);
   if (FRONT_ON) {
-    startWeb(toBase64(allNodes));
+    startWeb(subscription);
     const bases = CF_ON
       ? (CF_HOSTNAME ? [`https://${CF_HOSTNAME}`] : [])
       : [`${FRONT_TLS ? 'https' : 'http'}://${PUBLIC_ADDRESS}:${FRONT_PORT}`];
