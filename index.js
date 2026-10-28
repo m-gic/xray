@@ -220,7 +220,7 @@ let WG_SERVER_PRIV = '', WG_SERVER_PUB = '', WG_CLIENT_PRIV = '', WG_CLIENT_PUB 
 let CERT_FILE = '', KEY_FILE = '', TLS_SERVER_NAME = '', TLS_INSECURE = true, PIN = '';
 
 function checkPorts() {
-  const used = [REALITY_PORT, FRONT_ON && !CF_ON && !SHARE_FRONT && FRONT_PORT, CF_PORT, MIXED_PORT].filter(Boolean);
+  const used = [REALITY, PORT && !SHARE_FRONT && FRONT_PORT, CF_ON && CF_PORT, P.mixed].filter(Boolean);
   const dup = used.find((p, i) => used.indexOf(p) !== i);
   if (dup !== undefined) die(`[MODE] Port ${dup} is used more than once`);
 }
@@ -333,10 +333,11 @@ const vless = (fallbacks, flow) => ({
 function buildConfig() {
   const ib = [];
   if (XHTTP_ON) ib.push(inbound('vless-xhttp-in', XHTTP_SOCKET, undefined, 'vless', vless(), streamXhttp()));
-  if (FRONT_ON) {
-    const fb = [...(XHTTP_ON ? [{ path: XHTTP_PATH, dest: XHTTP_SOCKET, xver: 0 }] : []), { dest: WEB_SOCKET, xver: 0 }];
-    const [listen, port] = CF_ON ? ['::', CF_PORT] : SHARE_FRONT ? [FRONT_SOCKET, undefined] : ['::', FRONT_PORT];
-    ib.push(inbound('front-in', listen, port, 'vless', vless(fb), FRONT_TLS ? streamTls('tcp', 'http/1.1') : streamTcp()));
+   if (FRONT_ON) {
+    const fallbacks = [...(XHTTP ? [{ path: XHTTP_PATH, dest: SOCK['vless-xhttp'], xver: 0 }] : []), { dest: SOCK.web, xver: 0 }];
+    if (PORT) inbounds.push(ib('front-in', SHARE_FRONT ? SOCK.front : '::', SHARE_FRONT ? undefined : FRONT_PORT, 'vless',
+      vlessSettings(fallbacks), FRONT_TLS ? tlsStream('tcp', 'http/1.1') : TCP));
+    if (CF_ON) inbounds.push(ib('cf-front-in', '::', CF_PORT, 'vless', vlessSettings(fallbacks), TCP));
   }
   if (REALITY_PORT) ib.push(inbound('vless-in', '::', REALITY_PORT, 'vless', vless(undefined, VLESS_FLOW),
     SHARE_FRONT ? streamReality(FRONT_SOCKET, TLS_SERVER_NAME) : streamReality()));
@@ -392,28 +393,33 @@ const wgConfig = () => `[Interface]\nPrivateKey = ${WG_CLIENT_PRIV}\nAddress = $
 // 复用到 Xray abstract socket / 回落目标的长连接，避免每个请求都新建连接
 const upstreamAgent = new http.Agent({ keepAlive: true, keepAliveMsecs: 30000, maxSockets: 512 });
 
-function startWeb(subscriptionBody) {
-  const [destHost, destPort] = WEB_DEST.split(':');
-  const xhttpSocketPath = `\0${XHTTP_SOCKET.slice(1)}`;
+function startWeb(subBody) {
+  const [dh, dp] = WEB_DEST.split(':');
   http.createServer((req, res) => {
     const pathname = req.url.split('?')[0];
+    const isGet = req.method === 'GET' || req.method === 'HEAD';
+    const send = (status, type, body) => {
+      res.writeHead(status, { 'Content-Type': type, 'Cache-Control': 'no-store' });
+      res.end(req.method === 'HEAD' ? undefined : body);
+    };
     const forward = (opts) => {
-      const up = http.request({ ...opts, path: req.url, method: req.method, headers: req.headers, agent: upstreamAgent }, (ur) => {
+      const up = http.request({ agent: upstream, ...opts, path: req.url, method: req.method, headers: req.headers }, (ur) => {
         res.writeHead(ur.statusCode, ur.headers);
         ur.pipe(res);
       });
       up.on('error', () => { if (!res.headersSent) res.writeHead(502); res.end(); });
       req.pipe(up);
     };
-    if (XHTTP_ON && (pathname === XHTTP_PATH || pathname.startsWith(`${XHTTP_PATH}/`))) return forward({ socketPath: xhttpSocketPath });
-    if ((req.method === 'GET' || req.method === 'HEAD') && pathname === `/${UUID}`) {
-      res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8', 'Cache-Control': 'no-store' });
-      return res.end(req.method === 'HEAD' ? undefined : subscriptionBody);
+    if (XHTTP && (pathname === XHTTP_PATH || pathname.startsWith(`${XHTTP_PATH}/`))) return forward({ socketPath: abs(SOCK['vless-xhttp']) });
+    if (isGet && subBody && pathname === `/${UUID}`) return send(200, 'text/plain; charset=utf-8', subBody);
+    if (isGet && pathname === '/') {
+      const index = readText(path.join(BASE_DIR, 'index.html'));
+      return index ? send(200, 'text/html; charset=utf-8', index) : send(200, 'text/plain; charset=utf-8', 'Hello, World!\n');
     }
-    if (!WEB_DEST) { res.writeHead(404, { 'Content-Type': 'text/plain' }); return res.end('Not Found'); }
-    forward({ host: destHost, port: +destPort, agent: false });
+    if (!WEB_DEST) return send(404, 'text/plain; charset=utf-8', 'Not Found');
+    forward({ host: dh, port: +dp, agent: false });
   }).on('error', (e) => console.error(`[WEB] HTTP service failed: ${e.message}`))
-    .listen(`\0${WEB_SOCKET.slice(1)}`);
+    .listen(abs(SOCK.web));
 }
 
 // ========== 外部程序 ==========
@@ -499,14 +505,26 @@ async function main() {
     FRONT_PORT = +PORT;
   }
   SHARE_FRONT = !!REALITY_PORT && REALITY_PORT === FRONT_PORT;
-  FRONT_TLS = !CF_ON && (XHTTP_ON || SHARE_FRONT);
+  if (!PORT && !TUNNEL && XHTTP) {
+    console.log('[MODE] PORT is empty: xhttp is disabled (set PORT, or CLOUDFLARE_TUNNEL_TOKEN)');
+    XHTTP = false;
+  }
+  CF_ON = !!TUNNEL;
+  if (PORT) {
+    if (!validPort(PORT)) die(`[MODE] PORT='${PORT}' is not a valid port`);
+    FRONT_PORT = +PORT;
+    SHARE_FRONT = REALITY === FRONT_PORT && REALITY > 0;
+  }
+  FRONT_ON = CF_ON || !!PORT;
+  FRONT_TLS = !!PORT && (XHTTP || SHARE_FRONT);
+  XRAY_ON = XHTTP || !!REALITY || FRONT_ON || !!(P.hy2 || P.mixed || P.wg);
   checkPorts();
 
-  if (XHTTP_ON || REALITY_PORT) console.log(`[MODE] enabled=vless${XHTTP_ON ? ' xhttp' : ''}${REALITY_PORT ? ' reality' : ''}`);
-  if (CF_ON) console.log(`[MODE] cloudflare tunnel (${CLOUDFLARE_TUNNEL_TOKEN === 'try' ? 'quick' : 'fixed'}): xhttp (tunnel port decided by cloudflared log)`);
-  else if (FRONT_ON) console.log(`[MODE] port ${FRONT_PORT}: ${XHTTP_ON ? 'xhttp' : 'subscription only'}${SHARE_FRONT ? ' shared with reality' : ''}`);
-  if (REALITY_PORT) console.log(`[MODE] port ${REALITY_PORT}: reality`);
-  VLESS_FLOW = REALITY_PORT ? 'xtls-rprx-vision' : '';
+  if (XHTTP || REALITY) console.log(`[MODE] enabled=vless${XHTTP ? ' xhttp' : ''}${REALITY ? ' reality' : ''}`);
+  if (PORT) console.log(`[MODE] port ${FRONT_PORT}: web${XHTTP ? ' + xhttp' : ''}${SHARE_FRONT ? ' shared with reality' : ''}`);
+  if (CF_ON) console.log(`[MODE] cloudflare tunnel (${TUNNEL === 'try' ? 'quick' : 'fixed'}): web${XHTTP ? ' + xhttp' : ''} (tunnel port decided by cloudflared log)`);
+  if (REALITY) console.log(`[MODE] port ${REALITY}: reality`);
+  FLOW = REALITY ? 'xtls-rprx-vision' : '';
   XRAY_ON = XHTTP_ON || !!REALITY_PORT || !!(HY2_PORT || MIXED_PORT || WG_PORT);
 
   const KOMARI_ON = !!(KOMARI_ENDPOINT && KOMARI_TOKEN);
