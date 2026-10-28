@@ -42,7 +42,6 @@ CONFIG.CERT_HOST = CONFIG.CERT_HOST.replace(/^[a-z]+:\/\//i, '').replace(/[/:].*
 CONFIG.VLESS_MODE = CONFIG.VLESS_MODE.toLowerCase();
 CONFIG.LOG_LEVEL = CONFIG.LOG_LEVEL.toLowerCase();
 // UUID 必须由用户提供：自动生成的 UUID 不会保存，每次启动都会变，订阅链接随之失效
-if (!CONFIG.UUID) die('[CONFIG] UUID is required, set it in the environment or in .env (e.g. node -e "console.log(crypto.randomUUID())")');
 for (const k of ['VMESS_MODE', 'TROJAN_MODE', 'SHADOWSOCKS_MODE']) {
   if (process.env[k]) console.error(`[MODE] ${k} is no longer supported and is ignored`);
 }
