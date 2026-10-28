@@ -5,68 +5,75 @@ const req = (m) => (typeof require === 'function' ? require(m) : process.getBuil
 const crypto = req('crypto'), fs = req('fs'), path = req('path'), cp = req('child_process');
 const https = req('https'), http = req('http'), zlib = req('zlib'), dns = req('dns'), tls = req('tls');
 const { X509Certificate } = crypto, { pipeline } = req('stream').promises;
-const SCRIPT_PATH = path.resolve(process.argv[1]), BASE_DIR = path.dirname(SCRIPT_PATH), ENV_FILE = path.join(BASE_DIR, '.env');
-const readText = (f) => { try { return fs.readFileSync(f, 'utf8'); } catch { return ''; } };
-loadEnv(ENV_FILE);
+const BASE_DIR = path.dirname(path.resolve(process.argv[1]));
 
-const getEnv = (key, def = '') => (process.env[key] ?? def).trim();
-const getEnvMode = (key, def = '') => getEnv(key, def).toLowerCase();
+const readText = (f) => { try { return fs.readFileSync(f, 'utf8'); } catch { return ''; } };
+const die = (msg) => { console.error(msg); process.exit(1); };
 
 // ========== 用户配置(优先级：环境变量 > 同目录 .env > 默认值) ==========
-// VLESS_MODE 写法：xhttp / 端口号(Reality)，多个用逗号分隔。配置了 CLOUDFLARE_TUNNEL_TOKEN 时 xhttp 走 Cloudflare Tunnel
 const CONFIG = {
-  NAME: getEnv('NAME', ''),
-  UUID: getEnv('UUID', ''),
-  CLOUDFLARE_TUNNEL_TOKEN: getEnv('CLOUDFLARE_TUNNEL_TOKEN', ''),
-  CLOUDFLARE_IP: getEnv('CLOUDFLARE_IP', 'www.gov.tw'),
-  PORT: getEnv('PORT', ''),
-  CERT_HOST: getEnv('CERT_HOST', ''),
-  VLESS_MODE: getEnvMode('VLESS_MODE', ''),
-  HYSTERIA2_MODE: getEnv('HYSTERIA2_MODE', ''),
-  MIXED_MODE: getEnv('MIXED_MODE'),
-  WIREGUARD_MODE: getEnv('WIREGUARD_MODE'),
-  WORK_DIR: getEnv('WORK_DIR', './'),
-  KOMARI_ENDPOINT: getEnv('KOMARI_ENDPOINT', ''),
-  KOMARI_TOKEN: getEnv('KOMARI_TOKEN', ''),
-  LOG_LEVEL: getEnvMode('LOG_LEVEL', 'warning'),
+  NAME: '',
+  UUID: '',
+  CLOUDFLARE_TUNNEL_TOKEN: '',
+  CLOUDFLARE_IP: 'www.gov.tw',
+  PORT: '',
+  CERT_HOST: '',
+  VLESS_MODE: '',
+  HYSTERIA2_MODE: '',
+  MIXED_MODE: '',
+  WIREGUARD_MODE: '',
+  WORK_DIR: './',
+  KOMARI_ENDPOINT: '',
+  KOMARI_TOKEN: '',
+  LOG_LEVEL: 'warning',
 };
-normalizeConfig();
-const { NAME, UUID, CLOUDFLARE_TUNNEL_TOKEN, CLOUDFLARE_IP, PORT, VLESS_MODE,
-  HYSTERIA2_MODE, MIXED_MODE, WIREGUARD_MODE, CERT_HOST, KOMARI_ENDPOINT, KOMARI_TOKEN, LOG_LEVEL } = CONFIG;
-
-for (const k of ['VMESS_MODE', 'TROJAN_MODE', 'SHADOWSOCKS_MODE']) {
-  if (getEnv(k)) console.error(`[MODE] ${k} is no longer supported and is ignored`);
-}
-
-const QUIET = LOG_LEVEL === 'none';
-if (QUIET) console.log = console.error = () => {};
-const STDIO = QUIET ? 'ignore' : 'inherit';
-const uuidHash = crypto.createHash('sha256').update(UUID).digest('hex'), hp = uuidHash.slice(0, 4);
-const ARCH = { x64: 'amd64', arm64: 'arm64' }[process.arch];
-
-console.log('[ENV]', Object.entries(CONFIG).filter(([, v]) => v).map(([k, v]) => `${k}=${/UUID|TOKEN/.test(k) ? `${v.slice(0, 4)}***` : v}`).join(' '));
-
-const die = (msg) => { console.error(msg); process.exit(1); };
-let WORK_DIR = '';
-for (const dir of [...(CONFIG.WORK_DIR ? [path.resolve(BASE_DIR, CONFIG.WORK_DIR)] : []), `/var/lib/.cache${hp}`, `/tmp/.cache${hp}`]) {
-  try { fs.mkdirSync(dir, { recursive: true }); fs.accessSync(dir, fs.constants.R_OK | fs.constants.W_OK); WORK_DIR = dir; break; }
-  catch (e) { console.error(`[DIR] Cannot access ${dir}: ${e.message}`); }
-}
-if (!WORK_DIR) process.exit(1);
-console.log(`[DIR] Work directory: ${WORK_DIR}`);
-process.chdir(WORK_DIR);
-if (!ARCH) die(`[ARCH] Unsupported architecture: ${process.arch}`);
-
-// ========== 通用函数 ==========
 function loadEnv(f) {
-  try { return process.loadEnvFile(f); } catch (e) { if (e.code === 'ENOENT') return; }
-  for (const line of readText(f).split(/\r?\n/)) {
-    const m = line.match(/^\s*(?:export\s+)?([A-Za-z_]\w*)\s*=\s*(.*)$/);
-    if (!m || line.trim().startsWith('#')) continue;
-    const raw = m[2].trim(), q = raw.match(/^(['"])(.*?)\1/);
-    if (process.env[m[1]] === undefined) process.env[m[1]] = q ? q[2] : raw.replace(/\s+#.*$/, '');
+  try { return process.loadEnvFile(f); } catch {}
+  for (const [, k, v] of readText(f).matchAll(/^\s*(?:export\s+)?([A-Za-z_]\w*)\s*=\s*(.*)$/gm)) {
+    const raw = v.trim();
+    process.env[k] ??= raw.match(/^(['"])(.*?)\1/)?.[2] ?? raw.replace(/\s+#.*$/, '');
   }
 }
+
+loadEnv(path.join(BASE_DIR, '.env'));
+for (const k of Object.keys(CONFIG)) CONFIG[k] = (process.env[k] ?? CONFIG[k]).trim();
+CONFIG.PORT = CONFIG.PORT.replace(/^0+$/, '');
+CONFIG.CERT_HOST = CONFIG.CERT_HOST.replace(/^[a-z]+:\/\//i, '').replace(/[/:].*$/, '');
+CONFIG.VLESS_MODE = CONFIG.VLESS_MODE.toLowerCase();
+CONFIG.LOG_LEVEL = CONFIG.LOG_LEVEL.toLowerCase();
+// UUID 必须由用户提供：自动生成的 UUID 不会保存，每次启动都会变，订阅链接随之失效
+if (!CONFIG.UUID) die('[CONFIG] UUID is required, set it in the environment or in .env (e.g. node -e "console.log(crypto.randomUUID())")');
+for (const k of ['VMESS_MODE', 'TROJAN_MODE', 'SHADOWSOCKS_MODE']) {
+  if (process.env[k]) console.error(`[MODE] ${k} is no longer supported and is ignored`);
+}
+const { NAME, UUID, CLOUDFLARE_TUNNEL_TOKEN: TUNNEL, CLOUDFLARE_IP: CF_IP, PORT, CERT_HOST, LOG_LEVEL: LOG,
+  KOMARI_ENDPOINT: KOMARI_EP, KOMARI_TOKEN } = CONFIG;
+const QUIET = LOG === 'none';
+if (QUIET) console.log = console.error = () => {};
+const STDIO = QUIET ? 'ignore' : 'inherit';
+const sha256 = (s) => crypto.createHash('sha256').update(s).digest('hex');
+const uuidHash = sha256(UUID), hp = uuidHash.slice(0, 4), N = urlEncode(NAME);
+const ARCH = { x64: 'amd64', arm64: 'arm64' }[process.arch];
+if (!ARCH) die(`[ARCH] Unsupported architecture: ${process.arch}`);
+console.log('[ENV]', Object.entries(CONFIG).filter(([, v]) => v)
+  .map(([k, v]) => `${k}=${/UUID|TOKEN/.test(k) ? `${v.slice(0, 4)}***` : v}`).join(' '));
+
+// ========== 通用函数 ==========
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const IPV4 = /^\d{1,3}(\.\d{1,3}){3}$/;
+const validPort = (v) => /^\d+$/.test(v) && +v >= 1 && +v <= 65535;
+const nonEmpty = (f) => { try { return fs.statSync(f).size > 0; } catch { return false; } };
+function urlEncode(t) { return encodeURIComponent(t).replace(/[!'()*]/g, (c) => `%${c.charCodeAt(0).toString(16).toUpperCase()}`); }
+const abs = (s) => `\0${s.slice(1)}`; // Xray 的 "@name" 抽象套接字 -> Node 的 "\0name"
+
+let WORK = '';
+for (const d of [CONFIG.WORK_DIR && path.resolve(BASE_DIR, CONFIG.WORK_DIR), `/var/lib/.cache${hp}`, `/tmp/.cache${hp}`].filter(Boolean)) {
+  try { fs.mkdirSync(d, { recursive: true }); fs.accessSync(d, fs.constants.R_OK | fs.constants.W_OK); WORK = d; break; }
+  catch (e) { console.error(`[DIR] Cannot access ${d}: ${e.message}`); }
+}
+if (!WORK) process.exit(1);
+console.log(`[DIR] Work directory: ${WORK}`);
+process.chdir(WORK);
 // UUID 必须由用户提供：自动生成的 UUID 不会保存，每次启动都会变，订阅链接随之失效
 function normalizeConfig() {
   if (!CONFIG.UUID) {
