@@ -15,7 +15,6 @@ const CONFIG = {
   NAME: '',
   UUID: '',
   CLOUDFLARE_TUNNEL_TOKEN: '',
-  CLOUDFLARE_IP: 'www.gov.tw',
   PORT: '',
   CERT_HOST: '',
   VLESS_MODE: '',
@@ -47,7 +46,7 @@ if (!CONFIG.UUID) die('[CONFIG] UUID is required, set it in the environment or i
 for (const k of ['VMESS_MODE', 'TROJAN_MODE', 'SHADOWSOCKS_MODE']) {
   if (process.env[k]) console.error(`[MODE] ${k} is no longer supported and is ignored`);
 }
-const { NAME, UUID, CLOUDFLARE_TUNNEL_TOKEN: TUNNEL, CLOUDFLARE_IP: CF_IP, PORT, CERT_HOST, LOG_LEVEL: LOG,
+const { NAME, UUID, CLOUDFLARE_TUNNEL_TOKEN: TUNNEL, PORT, CERT_HOST, LOG_LEVEL: LOG,
   KOMARI_ENDPOINT: KOMARI_EP, KOMARI_TOKEN } = CONFIG;
 const QUIET = LOG === 'none';
 if (QUIET) console.log = console.error = () => {};
@@ -75,6 +74,95 @@ for (const d of [CONFIG.WORK_DIR && path.resolve(BASE_DIR, CONFIG.WORK_DIR), `/v
 if (!WORK) process.exit(1);
 console.log(`[DIR] Work directory: ${WORK}`);
 process.chdir(WORK);
+
+// ========== 协议常量 ==========
+// xhttp 路径由 UUID 派生，固定且较短
+const XHTTP_PATH = `/${sha256(`xhttp-path:${UUID}`).slice(0, 8)}`;
+const sha1Tag = crypto.createHash('sha1').update(BASE_DIR).digest('hex').slice(0, 8);
+const SOCK = Object.fromEntries(['vless-xhttp', 'cf-xhttp', 'front', 'web', 'tunnel-web'].map((n) => [n, `@xray-${sha1Tag}-${n}`]));
+const QUICK_TUNNEL_PORT = 8000, WG_CLIENT_ADDR = '10.0.0.2/32', TRACE = 'https://one.one.one.one/cdn-cgi/trace';
+
+// ========== 运行结果(只有运行时才能得到) ==========
+let CF_PORT = 0, CF_HOST = '', IPV6 = false, PUBLIC_ADDR = '';
+let RK_PRIV = '', RK_PUB = '', SID = '', WGK = {};
+let CERT_FILE = '', KEY_FILE = '', TLS_NAME = '', TLS_INSECURE = true, PIN = '';
+
+// ========== 运行计划：所有联动规则集中在 makePlan，推导一次后冻结 ==========
+let plan;
+
+function assertUnique(list) {
+  const ports = list.filter(Boolean);
+  const dup = ports.find((p, i) => ports.indexOf(p) !== i);
+  if (dup !== undefined) die(`[MODE] Port ${dup} is used more than once`);
+}
+
+// 运行时新增的端口(如隧道端口)用 extra 传入
+function checkPorts(extra = []) {
+  assertUnique([plan.reality, !plan.shareFront && plan.direct, plan.mixed, ...extra]);
+}
+
+function makePlan() {
+  const mode = { xhttp: false, cloudflare: false, reality: 0 };
+  for (const t of CONFIG.VLESS_MODE.split(',').map((s) => s.trim()).filter(Boolean)) {
+    if (t === 'ws') die("[MODE] VLESS_MODE: 'ws' is no longer supported, use xhttp");
+    if (t === 'xhttp') {
+      if (mode.xhttp) die("[MODE] VLESS_MODE: 'xhttp' is given more than once");
+      mode.xhttp = true;
+    } else if (t === 'cloudflare') {
+      if (mode.cloudflare) die("[MODE] VLESS_MODE: 'cloudflare' is given more than once");
+      mode.cloudflare = true;
+    } else if (/^\d+$/.test(t)) {
+      if (!validPort(t)) die(`[MODE] VLESS_MODE='${t}': port must be 1-65535`);
+      if (mode.reality) die('[MODE] VLESS_MODE: only one Reality port is allowed');
+      mode.reality = +t;
+    } else die(`[MODE] VLESS_MODE='${t}' is invalid (expected xhttp, cloudflare or a port)`);
+  }
+
+  const port = (name, v, desc) => {
+    if (!v) return 0;
+    if (!validPort(v)) die(`[MODE] ${name}='${v}' is invalid (expected a port 1-65535, or empty to disable)`);
+    console.log(`[MODE] port ${+v}/${desc}`);
+    return +v;
+  };
+
+  const direct = port('PORT', PORT, 'web');
+  const hy2 = port('HYSTERIA2_MODE', CONFIG.HYSTERIA2_MODE, 'udp: hysteria2');
+  const mixed = port('MIXED_MODE', CONFIG.MIXED_MODE, 'tcp: mixed (socks5 + http)');
+  const wg = port('WIREGUARD_MODE', CONFIG.WIREGUARD_MODE, 'udp: wireguard');
+  const tunnel = !!TUNNEL;
+  const reality = mode.reality;
+
+  // 规则一：xhttp 只走直连端口，与隧道互不影响
+  const xhttp = mode.xhttp && !!direct;
+  if (mode.xhttp && !direct) console.log('[MODE] PORT is empty: xhttp is disabled (xhttp needs a direct PORT)');
+  // 规则一之二：cloudflare 模式的 xhttp 只走隧道，与直连 xhttp 互不影响
+  const cfXhttp = mode.cloudflare && tunnel;
+  if (mode.cloudflare && !tunnel) console.log('[MODE] CLOUDFLARE_TUNNEL_TOKEN is empty: cloudflare mode is disabled');
+  // 规则二：Web 由直连端口或隧道提供
+  const web = !!(direct || tunnel);
+  // 规则三：Reality 与直连端口相同时共用端口，由 Reality 回落到前置入口
+  const shareFront = !!direct && direct === reality;
+  // 规则四：只有直连端口上的 xhttp 或共用端口需要 TLS，隧道的 TLS 由 Cloudflare 终止
+  const frontTls = !!direct && (xhttp || shareFront);
+  // 规则五：Web 回落目标只在直连端口且配置了 CERT_HOST 时存在
+  const webDest = direct && CERT_HOST ? `${CERT_HOST}:80` : '';
+  if (webDest && !/^[A-Za-z0-9.-]+:\d{1,5}$/.test(webDest)) die(`[WEB] CERT_HOST='${CERT_HOST}' is invalid (expected a domain or an IPv4 address)`);
+  if (webDest) console.log(`[WEB] Fallback for other paths on the front port: ${webDest}`);
+
+  assertUnique([reality, !shareFront && direct, mixed]); // 隧道端口运行时才知道，startCloudflared 后再查一次
+
+  return Object.freeze({
+    direct, tunnel, web, xhttp, cfXhttp, reality, hy2, mixed, wg, shareFront, frontTls, webDest,
+    flow: reality ? 'xtls-rprx-vision' : '',
+    // 规则六：只要有任何需要 Xray 的入口或协议，就运行 Xray；Komari 独立决定
+    xray: web || !!reality || !!(hy2 || mixed || wg),
+    komari: !!(KOMARI_EP && KOMARI_TOKEN),
+    // 规则七：需要公网地址的场景
+    net: !!(direct || reality || hy2 || mixed || wg),
+    // 规则八：需要自签或自有证书的场景
+    tls: frontTls || !!hy2,
+  });
+}
 
 // ========== 网络 / 文件 ==========
 // HTTPS 请求：跟随重定向；传 outputFile 则写入文件，否则返回 { status, body }
@@ -172,24 +260,6 @@ function spawnBg(bin, args, logFile, extra = {}) {
   return child;
 }
 
-// ========== 协议常量与状态 ==========
-const XHTTP_PATH = `/${UUID}-vless-xhttp`;
-const sha1Tag = crypto.createHash('sha1').update(BASE_DIR).digest('hex').slice(0, 8);
-const SOCK = Object.fromEntries(['vless-xhttp', 'front', 'web'].map((n) => [n, `@xray-${sha1Tag}-${n}`]));
-const QUICK_TUNNEL_PORT = 8000, WG_CLIENT_ADDR = '10.0.0.2/32', TRACE = 'https://one.one.one.one/cdn-cgi/trace';
-
-let XHTTP = false, REALITY = 0, FRONT_ON = false, CF_ON = false, SHARE_FRONT = false, FRONT_TLS = false;
-let FRONT_PORT = 0, CF_PORT = 0, CF_HOST = '', XRAY_ON = false, IPV6 = false, FLOW = '', WEB_DEST = '';
-let RK_PRIV = '', RK_PUB = '', SID = '', PUBLIC_ADDR = '', WGK = {};
-let CERT_FILE = '', KEY_FILE = '', TLS_NAME = '', TLS_INSECURE = true, PIN = '';
-const P = {}; // 端口：hy2 / mixed / wg
-
-function checkPorts() {
-  const used = [REALITY, PORT && !SHARE_FRONT && FRONT_PORT, CF_ON && CF_PORT, P.mixed].filter(Boolean);
-  const dup = used.find((p, i) => used.indexOf(p) !== i);
-  if (dup !== undefined) die(`[MODE] Port ${dup} is used more than once`);
-}
-
 // ========== TLS 证书 ==========
 // 自签证书(RSA 2048，10 年)；已有且 30 天内不过期则复用
 function selfSigned(cn) {
@@ -259,6 +329,7 @@ function deriveKey(label, enc) {
   return [priv.toString(enc), Buffer.from(pub).toString(enc)];
 }
 
+// 公网地址：CERT_HOST 是 IP 直接用；是域名且指向本机时用域名；否则用探测到的出口 IP
 async function resolveAddr() {
   if (IPV4.test(CERT_HOST)) PUBLIC_ADDR = CERT_HOST;
   else {
@@ -285,9 +356,10 @@ const realityStream = (dest = 'www.iij.ad.jp:443', sn = 'www.iij.ad.jp') => ({
   network: 'tcp', security: 'reality',
   realitySettings: { show: false, dest, xver: 0, serverNames: [sn], privateKey: RK_PRIV, shortIds: [SID] },
 });
+// alpn 可以是字符串或数组
 const tlsStream = (network, alpn, extra = {}) => ({
   network, security: 'tls',
-  tlsSettings: { serverName: TLS_NAME, alpn: [alpn], certificates: [{ certificateFile: CERT_FILE, keyFile: KEY_FILE }] },
+  tlsSettings: { serverName: TLS_NAME, alpn: [].concat(alpn), certificates: [{ certificateFile: CERT_FILE, keyFile: KEY_FILE }] },
   ...extra,
 });
 const vlessSettings = (fallbacks, flow) => ({
@@ -296,20 +368,34 @@ const vlessSettings = (fallbacks, flow) => ({
 
 function buildConfig() {
   const inbounds = [];
-  if (XHTTP) inbounds.push(ib('vless-xhttp-in', SOCK['vless-xhttp'], undefined, 'vless', vlessSettings(), xhttpStream(XHTTP_PATH)));
-  if (FRONT_ON) {
-    const fallbacks = [...(XHTTP ? [{ path: XHTTP_PATH, dest: SOCK['vless-xhttp'], xver: 0 }] : []), { dest: SOCK.web, xver: 0 }];
-    if (PORT) inbounds.push(ib('front-in', SHARE_FRONT ? SOCK.front : '::', SHARE_FRONT ? undefined : FRONT_PORT, 'vless',
-      vlessSettings(fallbacks), FRONT_TLS ? tlsStream('tcp', 'http/1.1') : TCP));
-    if (CF_ON) inbounds.push(ib('cf-front-in', '::', CF_PORT, 'vless', vlessSettings(fallbacks), TCP));
-  }
-  if (REALITY) inbounds.push(ib('vless-in', '::', REALITY, 'vless', vlessSettings(undefined, FLOW),
-    SHARE_FRONT ? realityStream(SOCK.front, TLS_NAME) : realityStream()));
-  if (P.hy2) inbounds.push(ib('hysteria2-in', '::', P.hy2, 'hysteria',
+  // xhttp 走默认回落：Xray 的 fallback path 不支持 h2，xhttp 放在无 path 条件的最后一条
+  const fallbacks = plan.xhttp
+    ? [
+        { path: `/${UUID}`, dest: SOCK.web, xver: 0 },
+        { dest: SOCK['vless-xhttp'], xver: 0 },
+      ]
+    : [
+        { path: `/${UUID}`, dest: SOCK.web, xver: 0 },
+        // 设置了 CERT_HOST 时其余请求回落到该站点，否则回落到 Node Web 服务(首页)
+        { dest: plan.webDest || SOCK.web, xver: 0 },
+      ];
+  if (plan.xhttp) inbounds.push(ib('vless-xhttp-in', SOCK['vless-xhttp'], undefined, 'vless', vlessSettings(), xhttpStream(XHTTP_PATH)));
+  if (plan.direct) inbounds.push(ib('front-in', plan.shareFront ? SOCK.front : '::', plan.shareFront ? undefined : plan.direct, 'vless',
+    vlessSettings(fallbacks), plan.frontTls ? tlsStream('tcp', ['h2', 'http/1.1']) : TCP));
+  if (plan.cfXhttp) inbounds.push(ib('vless-cf-xhttp-in', SOCK['cf-xhttp'], undefined, 'vless', vlessSettings(), xhttpStream(XHTTP_PATH)));
+  if (plan.tunnel) inbounds.push(ib('cf-front-in', '::', CF_PORT, 'vless',
+    vlessSettings([
+      { path: `/${UUID}`, dest: SOCK['tunnel-web'], xver: 0 },
+      // cloudflare 模式：其余请求交给 xhttp；否则全部回落到 Web
+      { dest: plan.cfXhttp ? SOCK['cf-xhttp'] : SOCK['tunnel-web'], xver: 0 },
+    ]), TCP));
+  if (plan.reality) inbounds.push(ib('vless-in', '::', plan.reality, 'vless', vlessSettings(undefined, plan.flow),
+    plan.shareFront ? realityStream(SOCK.front, TLS_NAME) : realityStream()));
+  if (plan.hy2) inbounds.push(ib('hysteria2-in', '::', plan.hy2, 'hysteria',
     { version: 2, clients: [{ auth: UUID, email: UUID }] }, tlsStream('hysteria', 'h3', { hysteriaSettings: { version: 2 } })));
-  if (P.mixed) inbounds.push(ib('mixed-in', '::', P.mixed, 'socks',
+  if (plan.mixed) inbounds.push(ib('mixed-in', '::', plan.mixed, 'socks',
     { auth: 'password', accounts: [{ user: UUID, pass: UUID }], udp: false }, TCP));
-  if (P.wg) inbounds.push(ib('wireguard-in', '::', P.wg, 'wireguard',
+  if (plan.wg) inbounds.push(ib('wireguard-in', '::', plan.wg, 'wireguard',
     { secretKey: WGK.sp, peers: [{ publicKey: WGK.cpub, allowedIPs: [WG_CLIENT_ADDR] }], mtu: 1420 }));
 
   return {
@@ -332,28 +418,31 @@ function buildConfig() {
 }
 
 // ========== 订阅链接 ==========
-const realityLink = () => `vless://${UUID}@${PUBLIC_ADDR}:${REALITY}?encryption=none${FLOW ? `&flow=${FLOW}` : ''}&security=reality&sni=${SHARE_FRONT ? TLS_NAME : 'www.iij.ad.jp'}&fp=chrome&pbk=${RK_PUB}&type=tcp&sid=${SID}#${N}`;
+const realityLink = () => `vless://${UUID}@${PUBLIC_ADDR}:${plan.reality}?encryption=none${plan.flow ? `&flow=${plan.flow}` : ''}&security=reality&sni=${plan.shareFront ? TLS_NAME : 'www.iij.ad.jp'}&fp=chrome&pbk=${RK_PUB}&type=tcp&sid=${SID}#${N}`;
 
-// 前置入口：走 Cloudflare Tunnel 时用 CF 域名 443，否则用直连地址
+// 直连 xhttp
 function frontNode() {
-  if (!XHTTP || (CF_ON && !CF_HOST)) return [];
-  const p = CF_ON
-    ? { address: CF_IP || CF_HOST, port: 443, host: CF_HOST, q: '' }
-    : { address: PUBLIC_ADDR, port: FRONT_PORT, host: TLS_NAME, q: TLS_INSECURE ? `&allowInsecure=1&pcs=${PIN}` : '' };
-  const name = urlEncode(REALITY ? `${NAME}-xhttp` : NAME);
-  return [`vless://${UUID}@${p.address}:${p.port}?encryption=none&security=tls&sni=${p.host}&fp=chrome&type=xhttp&host=${p.host}&path=${urlEncode(XHTTP_PATH)}&mode=auto${p.q}#${name}`];
+  if (!plan.xhttp) return [];
+  const name = urlEncode(plan.reality || plan.cfXhttp ? `${NAME}-xhttp` : NAME);
+  const insecure = TLS_INSECURE ? `&allowInsecure=1&pcs=${PIN}` : '';
+  return [`vless://${UUID}@${PUBLIC_ADDR}:${plan.direct}?encryption=none&security=tls&sni=${TLS_NAME}&fp=chrome&type=xhttp&host=${TLS_NAME}&path=${urlEncode(XHTTP_PATH)}&mode=auto${insecure}#${name}`];
 }
 
-const hy2Link = () => `hysteria2://${UUID}@${PUBLIC_ADDR}:${P.hy2}/?sni=${TLS_NAME}${TLS_INSECURE ? '&insecure=1' : ''}#${N}`;
-const mixedLinks = () => ['socks5', 'http'].map((s) => `${s}://${UUID}:${UUID}@${PUBLIC_ADDR}:${P.mixed}#${N}`).join('\n');
-const wgLink = () => `wireguard://${urlEncode(WGK.cpriv)}@${PUBLIC_ADDR}:${P.wg}?publickey=${urlEncode(WGK.spub)}&address=${urlEncode(WG_CLIENT_ADDR)}&mtu=1420#${N}`;
-const wgConfig = () => `[Interface]\nPrivateKey = ${WGK.cpriv}\nAddress = ${WG_CLIENT_ADDR}\nDNS = 1.1.1.1\nMTU = 1420\n\n[Peer]\nPublicKey = ${WGK.spub}\nEndpoint = ${PUBLIC_ADDR}:${P.wg}\nAllowedIPs = 0.0.0.0/0, ::/0\nPersistentKeepalive = 25\n`;
+// Cloudflare xhttp：Cloudflare 终止 TLS，对外固定 443
+function cfNode() {
+  if (!plan.cfXhttp) return [];
+  const name = urlEncode(plan.reality || plan.xhttp ? `${NAME}-cloudflare` : NAME);
+  return [`vless://${UUID}@${CF_HOST}:443?encryption=none&security=tls&sni=${CF_HOST}&alpn=h2&fp=chrome&type=xhttp&host=${CF_HOST}&path=${urlEncode(XHTTP_PATH)}&mode=auto#${name}`];
+}
 
-// ========== 内置 HTTP 服务(首页 + 订阅 + xhttp 转发 + 回落) ==========
-const upstream = new http.Agent({ keepAlive: true, keepAliveMsecs: 30000, maxSockets: 512 });
+const hy2Link = () => `hysteria2://${UUID}@${PUBLIC_ADDR}:${plan.hy2}/?sni=${TLS_NAME}${TLS_INSECURE ? '&insecure=1' : ''}#${N}`;
+const mixedLinks = () => ['socks5', 'http'].map((s) => `${s}://${UUID}:${UUID}@${PUBLIC_ADDR}:${plan.mixed}#${N}`).join('\n');
+const wgLink = () => `wireguard://${urlEncode(WGK.cpriv)}@${PUBLIC_ADDR}:${plan.wg}?publickey=${urlEncode(WGK.spub)}&address=${urlEncode(WG_CLIENT_ADDR)}&mtu=1420#${N}`;
+const wgConfig = () => `[Interface]\nPrivateKey = ${WGK.cpriv}\nAddress = ${WG_CLIENT_ADDR}\nDNS = 1.1.1.1\nMTU = 1420\n\n[Peer]\nPublicKey = ${WGK.spub}\nEndpoint = ${PUBLIC_ADDR}:${plan.wg}\nAllowedIPs = 0.0.0.0/0, ::/0\nPersistentKeepalive = 25\n`;
 
-function startWeb(subBody) {
-  const [dh, dp] = WEB_DEST.split(':');
+// ========== 内置 HTTP 服务(只提供首页和订阅) ==========
+// xhttp 与 CERT_HOST 回落均由 Xray 完成，这里其余请求返回 404
+function startWeb(sock, subBody) {
   http.createServer((req, res) => {
     const pathname = req.url.split('?')[0];
     const isGet = req.method === 'GET' || req.method === 'HEAD';
@@ -361,24 +450,14 @@ function startWeb(subBody) {
       res.writeHead(status, { 'Content-Type': type, 'Cache-Control': 'no-store' });
       res.end(req.method === 'HEAD' ? undefined : body);
     };
-    const forward = (opts) => {
-      const up = http.request({ agent: upstream, ...opts, path: req.url, method: req.method, headers: req.headers }, (ur) => {
-        res.writeHead(ur.statusCode, ur.headers);
-        ur.pipe(res);
-      });
-      up.on('error', () => { if (!res.headersSent) res.writeHead(502); res.end(); });
-      req.pipe(up);
-    };
-    if (XHTTP && (pathname === XHTTP_PATH || pathname.startsWith(`${XHTTP_PATH}/`))) return forward({ socketPath: abs(SOCK['vless-xhttp']) });
     if (isGet && subBody && pathname === `/${UUID}`) return send(200, 'text/plain; charset=utf-8', subBody);
     if (isGet && pathname === '/') {
       const index = readText(path.join(BASE_DIR, 'index.html'));
       return index ? send(200, 'text/html; charset=utf-8', index) : send(200, 'text/plain; charset=utf-8', 'Hello, World!\n');
     }
-    if (!WEB_DEST) return send(404, 'text/plain; charset=utf-8', 'Not Found');
-    forward({ host: dh, port: +dp, agent: false });
+    send(404, 'text/plain; charset=utf-8', 'Not Found');
   }).on('error', (e) => console.error(`[WEB] HTTP service failed: ${e.message}`))
-    .listen(abs(SOCK.web));
+    .listen(abs(sock));
 }
 
 // ========== 外部程序 ==========
@@ -387,7 +466,7 @@ async function startKomari() {
   await killPrevious(svc, 'KOMARI');
   const bin = await fetchBin(svc, `https://github.com/komari-monitor/komari-agent/releases/latest/download/komari-agent-linux-${ARCH}`);
   const extra = { AGENT_ENDPOINT: KOMARI_EP, AGENT_TOKEN: KOMARI_TOKEN };
-  if (XRAY_ON) {
+  if (plan.xray) {
     spawnBg(bin, [], QUIET ? '/dev/null' : path.join(WORK, `${svc}.log`), extra);
     return console.log(`[KOMARI] Agent started, reporting to ${KOMARI_EP}`);
   }
@@ -422,8 +501,8 @@ async function killAndFetchCf() {
 async function startCloudflared() {
   const { bin, logFile } = await killAndFetchCf();
   if (TUNNEL === 'try') {
-    CF_PORT = QUICK_TUNNEL_PORT;
-    checkPorts();
+    CF_PORT = 8000;
+    checkPorts([CF_PORT]);
     spawnBg(bin, ['--no-autoupdate', 'tunnel', '--url', `http://localhost:${CF_PORT}`], logFile);
     for (let i = 0; i < 30 && !CF_HOST; i++) {
       CF_HOST = [...readText(logFile).matchAll(/https:\/\/([a-z0-9-]+\.trycloudflare\.com)/g)]
@@ -439,88 +518,42 @@ async function startCloudflared() {
     if (!rule || !validPort(rule.port)) die(`[CF] Cannot read hostname / port from ${logFile} (needs a Public hostname without * and a Service like http://localhost:PORT), exiting`);
     CF_HOST = rule.hostname;
     CF_PORT = +rule.port;
-    checkPorts();
+    checkPorts([CF_PORT]);
     console.log(`[CF] From cloudflared log: hostname=${CF_HOST}, tunnel service port=${CF_PORT}`);
   }
   if (QUIET) fs.rmSync(logFile, { force: true });
 }
 
-// ========== 主流程 ==========
+// ========== 主流程(线性，只读取 plan) ==========
 async function main() {
-  // 1. 解析 VLESS_MODE
-  for (const t of CONFIG.VLESS_MODE.split(',').map((s) => s.trim()).filter(Boolean)) {
-    if (t === 'ws' || t === 'cloudflare') die(`[MODE] VLESS_MODE: '${t}' is no longer supported, use xhttp (with CLOUDFLARE_TUNNEL_TOKEN for Cloudflare Tunnel)`);
-    if (t === 'xhttp') {
-      if (XHTTP) die("[MODE] VLESS_MODE: 'xhttp' is given more than once");
-      XHTTP = true;
-    } else if (/^\d+$/.test(t)) {
-      if (!validPort(t)) die(`[MODE] VLESS_MODE='${t}': port must be 1-65535`);
-      if (REALITY) die('[MODE] VLESS_MODE: only one Reality port is allowed');
-      REALITY = +t;
-    } else die(`[MODE] VLESS_MODE='${t}' is invalid (expected xhttp or a port)`);
-  }
+  plan = makePlan();
 
-  // 2. 其他协议端口
-  const modePort = (name, v, desc) => {
-    if (!v) return 0;
-    if (!validPort(v)) die(`[MODE] ${name}='${v}' is invalid (expected a port 1-65535, or empty to disable)`);
-    console.log(`[MODE] port ${+v}/${desc}`);
-    return +v;
-  };
-  P.hy2 = modePort('HYSTERIA2_MODE', CONFIG.HYSTERIA2_MODE, 'udp: hysteria2');
-  P.mixed = modePort('MIXED_MODE', CONFIG.MIXED_MODE, 'tcp: mixed (socks5 + http)');
-  P.wg = modePort('WIREGUARD_MODE', CONFIG.WIREGUARD_MODE, 'udp: wireguard');
+  if (plan.xhttp || plan.cfXhttp || plan.reality) console.log(`[MODE] enabled=vless${plan.xhttp ? ' xhttp' : ''}${plan.cfXhttp ? ' cloudflare' : ''}${plan.reality ? ' reality' : ''}`);
+  if (plan.direct) console.log(`[MODE] port ${plan.direct}: web${plan.xhttp ? ' + xhttp' : ''}${plan.shareFront ? ' shared with reality' : ''}`);
+  if (plan.tunnel) console.log(`[MODE] cloudflare tunnel (${TUNNEL === 'try' ? 'quick' : 'fixed'}): web${plan.cfXhttp ? ' + xhttp' : ''} (tunnel port decided by cloudflared log)`);
+  if (plan.reality) console.log(`[MODE] port ${plan.reality}: reality`);
+  if (!plan.xray && !plan.komari) die('[MODE] Nothing to run: set PORT, CLOUDFLARE_TUNNEL_TOKEN, VLESS_MODE / HYSTERIA2_MODE / MIXED_MODE / WIREGUARD_MODE, or KOMARI_ENDPOINT + KOMARI_TOKEN');
+  if (plan.komari) await startKomari();
 
-  // 3. Web 回落目标
-  if (PORT && CERT_HOST) {
-    WEB_DEST = `${CERT_HOST}:80`;
-    if (!/^[A-Za-z0-9.-]+:\d{1,5}$/.test(WEB_DEST)) die(`[WEB] CERT_HOST='${CERT_HOST}' is invalid (expected a domain or an IPv4 address)`);
-    console.log(`[WEB] Other paths on the front port are forwarded to ${WEB_DEST}`);
-  }
-
-  // 4. 前置入口：PORT 直连，设置了隧道则另加隧道入口；无 PORT 且无隧道时 xhttp 没有入口
-  if (!PORT && !TUNNEL && XHTTP) {
-    console.log('[MODE] PORT is empty: xhttp is disabled (set PORT, or CLOUDFLARE_TUNNEL_TOKEN)');
-    XHTTP = false;
-  }
-  CF_ON = !!TUNNEL;
-  if (PORT) {
-    if (!validPort(PORT)) die(`[MODE] PORT='${PORT}' is not a valid port`);
-    FRONT_PORT = +PORT;
-    SHARE_FRONT = REALITY === FRONT_PORT && REALITY > 0;
-  }
-  FRONT_ON = CF_ON || !!PORT;
-  FRONT_TLS = !!PORT && (XHTTP || SHARE_FRONT);
-  XRAY_ON = XHTTP || !!REALITY || FRONT_ON || !!(P.hy2 || P.mixed || P.wg);
-  checkPorts();
-
-  if (XHTTP || REALITY) console.log(`[MODE] enabled=vless${XHTTP ? ' xhttp' : ''}${REALITY ? ' reality' : ''}`);
-  if (PORT) console.log(`[MODE] port ${FRONT_PORT}: web${XHTTP ? ' + xhttp' : ''}${SHARE_FRONT ? ' shared with reality' : ''}`);
-  if (CF_ON) console.log(`[MODE] cloudflare tunnel (${TUNNEL === 'try' ? 'quick' : 'fixed'}): web${XHTTP ? ' + xhttp' : ''} (tunnel port decided by cloudflared log)`);
-  if (REALITY) console.log(`[MODE] port ${REALITY}: reality`);
-  FLOW = REALITY ? 'xtls-rprx-vision' : '';
-
-  const KOMARI_ON = !!(KOMARI_EP && KOMARI_TOKEN);
-  if (!XRAY_ON && !KOMARI_ON) die('[MODE] Nothing to run: set PORT, CLOUDFLARE_TUNNEL_TOKEN, VLESS_MODE / HYSTERIA2_MODE / MIXED_MODE / WIREGUARD_MODE, or KOMARI_ENDPOINT + KOMARI_TOKEN');
-  if (KOMARI_ON) await startKomari();
-
-  // 5. 密钥与地址
-  if (REALITY) {
+  // 密钥
+  if (plan.reality) {
     [RK_PRIV, RK_PUB] = deriveKey('reality', 'base64url');
     SID = sha256(`reality-short-id:${UUID}`).slice(0, 8);
     console.log(`[REALITY] Private key: ${RK_PRIV}\n[REALITY] Public key: ${RK_PUB}\n[REALITY] Short ID: ${SID}`);
   }
-  if (P.wg) {
+  if (plan.wg) {
     const [sp, spub] = deriveKey('wg-server', 'base64'), [cpriv, cpub] = deriveKey('wg-client', 'base64');
     WGK = { sp, spub, cpriv, cpub };
   }
-  if (PORT || REALITY || P.hy2 || P.mixed || P.wg) await resolveAddr();
+
+  // 运行环境
+  if (plan.net) await resolveAddr();
   IPV6 = await request(TRACE, { family: 6, timeout: 5000 }).then(() => true, () => false);
   console.log(IPV6 ? '[NET] IPv6 egress: available' : '[NET] IPv6 egress: unavailable, blocking IPv6 destinations');
-  if (FRONT_TLS || P.hy2) setupTls();
-  if (CF_ON) await startCloudflared();
+  if (plan.tls) setupTls();
+  if (plan.tunnel) await startCloudflared();
 
-  // 6. Xray
+  // Xray
   const xrayBin = path.join(WORK, `xray-${hp}`), cfgFile = path.join(WORK, 'config.json'), zip = path.join(WORK, 'xray.zip');
   await killPrevious(`xray-${hp}`, 'XRAY');
   if (!await download(zip, `https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-${ARCH === 'amd64' ? '64' : 'arm64-v8a'}.zip`)) process.exit(1);
@@ -536,21 +569,23 @@ async function main() {
   fs.chmodSync(cfgFile, 0o600);
   if (cp.spawnSync(xrayBin, ['run', '-test', '-c', cfgFile], { stdio: STDIO, env: xrayEnv }).status !== 0) die('[XRAY] Config test failed, aborting');
 
-  // 7. 订阅输出
-  const allNodes = [REALITY && realityLink(), ...frontNode(), P.hy2 && hy2Link(), P.wg && wgLink(), P.mixed && mixedLinks()]
+  // 订阅输出
+  const allNodes = [plan.reality && realityLink(), ...frontNode(), ...cfNode(), plan.hy2 && hy2Link(), plan.wg && wgLink(), plan.mixed && mixedLinks()]
     .filter(Boolean).map((n) => `${n}\n`).join('');
   const subscription = Buffer.from(allNodes).toString('base64');
   console.log(`\n=== Nodes ===\n${allNodes}\n=== Subscription (base64) ===\n${subscription}\n`);
-  if (P.wg) console.log(`\n=== WireGuard config (wg-quick) ===\n${wgConfig()}`);
-  if (FRONT_ON) {
-    startWeb(allNodes ? subscription : '');
+  if (plan.wg) console.log(`\n=== WireGuard config (wg-quick) ===\n${wgConfig()}`);
+  if (plan.web) {
+    const sub = allNodes ? subscription : '';
+    if (plan.direct) startWeb(SOCK.web, sub);
+    if (plan.tunnel) startWeb(SOCK['tunnel-web'], sub);
     const bases = [];
-    if (CF_HOST) bases.push(`https://${CF_HOST}`);
-    if (PORT) bases.push(`${FRONT_TLS ? 'https' : 'http'}://${PUBLIC_ADDR}:${FRONT_PORT}`);
-    if (allNodes && bases.length) console.log(`\n=== Subscription URL ===\n${bases.map((b) => `${b}/${UUID}`).join('\n')}${FRONT_TLS && TLS_INSECURE ? '\n(自签证书：客户端需要允许不校验证书)' : ''}\n`);
+    if (plan.tunnel && CF_HOST) bases.push(`https://${CF_HOST}`);
+    if (plan.direct) bases.push(`${plan.frontTls ? 'https' : 'http'}://${PUBLIC_ADDR}:${plan.direct}`);
+    if (allNodes && bases.length) console.log(`\n=== Subscription URL ===\n${bases.map((b) => `${b}/${UUID}`).join('\n')}${plan.frontTls && TLS_INSECURE ? '\n(自签证书：客户端需要允许不校验证书)' : ''}\n`);
   }
 
-  // 8. systemd 服务文件(限制 Node 自身堆内存)
+  // systemd 服务文件(限制 Node 自身堆内存)
   const svcName = `cache-${uuidHash.slice(0, 6)}`, svcFile = path.join(WORK, `${svcName}.service`);
   fs.writeFileSync(svcFile, `[Unit]\nDescription=${svcName}\nAfter=network.target\n\n[Service]\nType=simple\nRestart=always\nRestartSec=5\nWorkingDirectory=${WORK}\nExecStart=${process.execPath} --max-old-space-size=48 ${path.resolve(process.argv[1])}\nKillMode=mixed\nKillSignal=SIGTERM\n\n[Install]\nWantedBy=multi-user.target\n`);
   console.log(`\n=== systemd service (${svcName}) ===\ncp ${svcFile} /etc/systemd/system/${svcName}.service\nsystemctl daemon-reload && systemctl enable --now ${svcName}`);
