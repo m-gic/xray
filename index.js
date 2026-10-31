@@ -1,17 +1,17 @@
 #!/usr/bin/env node
 'use strict';
-const req = (m) => (typeof require === 'function' ? require(m) : process.getBuiltinModule(`node:${m}`));
+const req = typeof require === 'function' ? require : (m) => process.getBuiltinModule(`node:${m}`);
 const crypto = req('crypto'), fs = req('fs'), path = req('path'), cp = req('child_process');
-const https = req('https'), http = req('http'), zlib = req('zlib'), dns = req('dns'), tls = req('tls'), net = req('net');
+const [https, http, zlib, dns, tls, net] = ['https', 'http', 'zlib', 'dns', 'tls', 'net'].map((m) => req(m));
 const { X509Certificate } = crypto, { pipeline } = req('stream').promises;
 const BASE_DIR = path.dirname(path.resolve(process.argv[1]));
 
 const readText = (f) => { try { return fs.readFileSync(f, 'utf8'); } catch { return ''; } };
+const nonEmpty = (f) => { try { return fs.statSync(f).size > 0; } catch { return false; } };
 const die = (msg) => { console.error(msg); process.exit(1); };
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const IPV4 = /^\d{1,3}(\.\d{1,3}){3}$/;
 const validPort = (v) => /^\d+$/.test(v) && +v >= 1 && +v <= 65535;
-const nonEmpty = (f) => { try { return fs.statSync(f).size > 0; } catch { return false; } };
 const sha256 = (s) => crypto.createHash('sha256').update(s).digest('hex');
 const urlEncode = (t) => encodeURIComponent(t).replace(/[!'()*]/g, (c) => `%${c.charCodeAt(0).toString(16).toUpperCase()}`);
 const abs = (s) => `\0${s.slice(1)}`; // Xray 的 "@name" 抽象套接字 -> Node 的 "\0name"
@@ -21,6 +21,7 @@ const CONFIG = {
   NAME: '',
   UUID: '',
   CLOUDFLARE_TUNNEL_TOKEN: '',
+  CLOUDFLARE_PROTOCOL: 'auto',
   PORT: '',
   CERT_HOST: '',
   VLESS_MODE: '',
@@ -44,6 +45,7 @@ CONFIG.PORT = CONFIG.PORT.replace(/^0+$/, '');
 CONFIG.CERT_HOST = CONFIG.CERT_HOST.replace(/^[a-z]+:\/\//i, '').replace(/[/:].*$/, '');
 CONFIG.VLESS_MODE = CONFIG.VLESS_MODE.toLowerCase();
 CONFIG.LOG_LEVEL = CONFIG.LOG_LEVEL.toLowerCase();
+CONFIG.CLOUDFLARE_PROTOCOL = CONFIG.CLOUDFLARE_PROTOCOL.toLowerCase();
 for (const k of ['VMESS_MODE', 'TROJAN_MODE', 'SHADOWSOCKS_MODE']) if (process.env[k]) console.error(`[MODE] ${k} is no longer supported and is ignored`);
 
 const { NAME, UUID, CLOUDFLARE_TUNNEL_TOKEN: TUNNEL, PORT, CERT_HOST, LOG_LEVEL: LOG, KOMARI_ENDPOINT: KOMARI_EP, KOMARI_TOKEN } = CONFIG;
@@ -68,22 +70,22 @@ const sha1Tag = crypto.createHash('sha1').update(BASE_DIR).digest('hex').slice(0
 const SOCK = Object.fromEntries(['vless-xhttp', 'cf-xhttp', 'front', 'web', 'tunnel-web'].map((n) => [n, `@xray-${sha1Tag}-${n}`]));
 const WG_CLIENT_ADDR = '10.0.0.2/32', TRACE = 'https://one.one.one.one/cdn-cgi/trace';
 
-// ========== 运行结果 ==========
+// ========== 运行状态 ==========
 let CF_PORT = 0, CF_HOST = '', IPV6 = false, PUBLIC_ADDR = '';
 let RK_PRIV = '', RK_PUB = '', SID = '', WGK = {};
 let CERT_FILE = '', KEY_FILE = '', TLS_NAME = '', TLS_INSECURE = true, PIN = '';
 let plan;
 
-function assertUnique(list) {
+const uniquePorts = (list) => {
   const ports = list.filter(Boolean);
   const dup = ports.find((p, i) => ports.indexOf(p) !== i);
   if (dup !== undefined) die(`[MODE] Port ${dup} is used more than once`);
-}
-const checkPorts = (extra = []) => assertUnique([plan.reality, !plan.shareFront && plan.direct, plan.mixed, ...extra]);
+};
 
 // ========== 运行计划：所有联动规则集中于此 ==========
 function makePlan() {
   if (TUNNEL === 'try') die("[CF] CLOUDFLARE_TUNNEL_TOKEN='try' is no longer supported. Leave it empty and set VLESS_MODE to include cloudflare to use a quick tunnel");
+  if (!['auto', 'http2', 'quic'].includes(CONFIG.CLOUDFLARE_PROTOCOL)) die(`[CF] CLOUDFLARE_PROTOCOL='${CONFIG.CLOUDFLARE_PROTOCOL}' is invalid (expected auto, http2 or quic)`);
 
   const mode = { xhttp: false, cloudflare: false, reality: 0 };
   for (const t of CONFIG.VLESS_MODE.split(',').map((s) => s.trim()).filter(Boolean)) {
@@ -121,15 +123,16 @@ function makePlan() {
   if (webDest && !/^[A-Za-z0-9.-]+:\d{1,5}$/.test(webDest)) die(`[WEB] CERT_HOST='${CERT_HOST}' is invalid (expected a domain or an IPv4 address)`);
   if (webDest) console.log(`[WEB] Fallback for other paths on the front port: ${webDest}`);
 
-  assertUnique([reality, !shareFront && direct, mixed]);
+  uniquePorts([reality, !shareFront && direct, mixed]);
 
+  const proxy = !!(tunnel || reality || hy2 || mixed || wg || xhttp); // 只有代理协议需要 Xray
   const anyNet = !!(direct || reality || hy2 || mixed || wg);
   return Object.freeze({
     direct, tunnel, quick, xhttp, reality, hy2, mixed, wg, shareFront, frontTls, webDest,
     cfXhttp: mode.cloudflare && tunnel,
     web: !!(direct || tunnel),
     flow: reality ? 'xtls-rprx-vision' : '',
-    xray: !!(direct || tunnel || reality || hy2 || mixed || wg),
+    xray: proxy,
     komari: !!(KOMARI_EP && KOMARI_TOKEN),
     net: anyNet,
     tls: frontTls || !!hy2,
@@ -382,8 +385,6 @@ function buildConfig() {
       rules: [
         { type: 'field', ip: ['geoip:private'], outboundTag: 'direct' },
         ...(IPV6 ? [] : [{ type: 'field', ip: ['::/0'], outboundTag: 'block' }]),
-        { type: 'field', domain: ['geosite:cn', 'geosite:category-ads-all'], outboundTag: 'block' },
-        { type: 'field', ip: ['geoip:cn'], outboundTag: 'block' },
       ],
     },
   };
@@ -411,6 +412,7 @@ const wgLink = () => `wireguard://${urlEncode(WGK.cpriv)}@${PUBLIC_ADDR}:${plan.
 const wgConfig = () => `[Interface]\nPrivateKey = ${WGK.cpriv}\nAddress = ${WG_CLIENT_ADDR}\nDNS = 1.1.1.1\nMTU = 1420\n\n[Peer]\nPublicKey = ${WGK.spub}\nEndpoint = ${PUBLIC_ADDR}:${plan.wg}\nAllowedIPs = 0.0.0.0/0, ::/0\nPersistentKeepalive = 25\n`;
 
 // ========== 内置 HTTP 服务(只提供首页和订阅) ==========
+// sock 可以是端口号(直接网页模式)，也可以是 Xray 回落用的抽象套接字名
 function startWeb(sock, subBody) {
   http.createServer((req, res) => {
     const pathname = req.url.split('?')[0];
@@ -426,7 +428,7 @@ function startWeb(sock, subBody) {
     }
     send(404, 'text/plain; charset=utf-8', 'Not Found');
   }).on('error', (e) => console.error(`[WEB] HTTP service failed: ${e.message}`))
-    .listen(abs(sock));
+    .listen(typeof sock === 'number' ? sock : abs(sock));
 }
 
 // ========== 外部程序 ==========
@@ -435,7 +437,7 @@ async function startKomari() {
   await killPrevious(svc, 'KOMARI');
   const bin = await fetchBin(svc, `https://github.com/komari-monitor/komari-agent/releases/latest/download/komari-agent-linux-${ARCH}`);
   const extra = { AGENT_ENDPOINT: KOMARI_EP, AGENT_TOKEN: KOMARI_TOKEN };
-  if (plan.xray) {
+  if (plan.xray || plan.direct) {
     spawnBg(bin, [], LOG === 'none' ? '/dev/null' : path.join(WORK, `${svc}.log`), extra);
     return console.log(`[KOMARI] Agent started, reporting to ${KOMARI_EP}`);
   }
@@ -476,19 +478,20 @@ async function waitForLog(logFile, pick, what) {
 async function startCloudflared() {
   const svc = `svc-c${hp}`;
   await killPrevious(svc, 'CF');
+  console.log(`[CF] Protocol: ${CONFIG.CLOUDFLARE_PROTOCOL}`);
   const bin = await fetchBin(svc, `https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${ARCH}`);
   cp.spawnSync(bin, ['--version'], { stdio: STDIO });
   const logFile = path.join(WORK, `${svc}.log`);
   if (plan.quick) {
     CF_PORT = await freePort([plan.direct, plan.reality, plan.mixed, plan.hy2, plan.wg]);
-    checkPorts([CF_PORT]);
-    spawnBg(bin, ['--no-autoupdate', 'tunnel', '--url', `http://localhost:${CF_PORT}`], logFile);
+    uniquePorts([plan.reality, !plan.shareFront && plan.direct, plan.mixed, CF_PORT]);
+    spawnBg(bin, ['--no-autoupdate', 'tunnel', '--protocol', CONFIG.CLOUDFLARE_PROTOCOL, '--url', `http://localhost:${CF_PORT}`], logFile);
     CF_HOST = await waitForLog(logFile, (t) => [...t.matchAll(/https:\/\/([a-z0-9-]+\.trycloudflare\.com)/g)]
       .map((m) => m[1]).find((h) => !h.startsWith('api.')) || '', 'the trycloudflare.com hostname');
     console.log(`[CF] Quick tunnel hostname: ${CF_HOST} (service port=${CF_PORT})`);
-    console.log('[CF] Quick Tunnel 域名每次启动都会变化，订阅链接需要重新获取；正式使用请改用固定隧道');
+    console.log('[CF] Quick tunnel hostname changes on every start; subscription links must be refreshed. Use a fixed tunnel for production.');
   } else {
-    spawnBg(bin, ['--no-autoupdate', 'tunnel', 'run'], logFile, { TUNNEL_TOKEN: TUNNEL });
+    spawnBg(bin, ['--no-autoupdate', 'tunnel', '--protocol', CONFIG.CLOUDFLARE_PROTOCOL, 'run'], logFile, { TUNNEL_TOKEN: TUNNEL });
     const text = await waitForLog(logFile, (t) => (t.includes('Updated to new configuration') ? t : ''), 'the tunnel configuration');
     const rule = parseIngress(text);
     if (!rule || !validPort(rule.port)) {
@@ -498,7 +501,7 @@ async function startCloudflared() {
     }
     CF_HOST = rule.hostname;
     CF_PORT = +rule.port;
-    checkPorts([CF_PORT]);
+    uniquePorts([plan.reality, !plan.shareFront && plan.direct, plan.mixed, CF_PORT]);
     console.log(`[CF] From cloudflared log: hostname=${CF_HOST}, tunnel service port=${CF_PORT}`);
   }
   if (LOG === 'none') fs.rmSync(logFile, { force: true });
@@ -513,7 +516,16 @@ async function main() {
   if (plan.direct) console.log(`[MODE] port ${plan.direct}: web${plan.xhttp ? ' + xhttp' : ''}${plan.shareFront ? ' shared with reality' : ''}`);
   if (plan.tunnel) console.log(`[MODE] cloudflare tunnel (${plan.quick ? 'quick' : 'fixed'}): web${plan.cfXhttp ? ' + xhttp' : ''} (tunnel port decided by cloudflared log)`);
   if (plan.reality) console.log(`[MODE] port ${plan.reality}: reality`);
-  if (!plan.xray && !plan.komari) die('[MODE] Nothing to run: set PORT, CLOUDFLARE_TUNNEL_TOKEN, VLESS_MODE / HYSTERIA2_MODE / MIXED_MODE / WIREGUARD_MODE, or KOMARI_ENDPOINT + KOMARI_TOKEN');
+  if (!plan.xray && !plan.komari && !plan.direct) die('[MODE] Nothing to run: set PORT, CLOUDFLARE_TUNNEL_TOKEN, VLESS_MODE / HYSTERIA2_MODE / MIXED_MODE / WIREGUARD_MODE, or KOMARI_ENDPOINT + KOMARI_TOKEN');
+
+  // 只有网页(无代理协议)：直接在 PORT 上提供网页，不需要 UUID，不下载 Xray
+  if (!plan.xray) {
+    if (plan.direct) startWeb(plan.direct, '');
+    if (plan.komari) await startKomari();
+    console.log('[MODE] No proxy protocol enabled, serving web page only');
+    return;
+  }
+
   if (plan.komari) await startKomari();
 
   if (plan.reality) {
@@ -561,7 +573,7 @@ async function main() {
     const bases = [];
     if (plan.tunnel && CF_HOST) bases.push(`https://${CF_HOST}`);
     if (plan.direct) bases.push(`${plan.frontTls ? 'https' : 'http'}://${PUBLIC_ADDR}:${plan.direct}`);
-    if (allNodes && bases.length) console.log(`\n=== Subscription URL ===\n${bases.map((b) => `${b}/${UUID}`).join('\n')}${plan.frontTls && TLS_INSECURE ? '\n(自签证书：客户端需要允许不校验证书)' : ''}\n`);
+    if (allNodes && bases.length) console.log(`\n=== Subscription URL ===\n${bases.map((b) => `${b}/${UUID}`).join('\n')}${plan.frontTls && TLS_INSECURE ? '\n(Self-signed certificate: clients must allow insecure TLS)' : ''}\n`);
   }
 
   // systemd 服务文件(限制 Node 自身堆内存)
