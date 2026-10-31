@@ -557,6 +557,8 @@ async function main() {
   try { fs.renameSync(path.join(WORK, 'xray'), xrayBin); } catch (e) { console.error(`[XRAY] Cannot rename binary: ${e.message}`); }
   if (!nonEmpty(xrayBin)) die(`[XRAY] Binary not found after extraction: ${xrayBin}`);
   fs.chmodSync(xrayBin, 0o755);
+  try { fs.accessSync(xrayBin, fs.constants.X_OK); }
+  catch { die(`[XRAY] ${xrayBin} is not executable (noexec mount or permission issue). Set WORK_DIR to an exec-enabled directory.`); }
   const xrayEnv = { ...process.env, ...GO_ENV, XRAY_LOCATION_ASSET: WORK };
 
   // 先以 600 权限写入(含 UUID 和 Reality 私钥)，再测试配置
@@ -586,6 +588,7 @@ async function main() {
   console.log(`\n=== systemd service (${svcName}) ===\ncp ${svcFile} /etc/systemd/system/${svcName}.service\nsystemctl daemon-reload && systemctl enable --now ${svcName}`);
 
   const xray = cp.spawn(xrayBin, ['run', '-c', cfgFile], { stdio: STDIO, env: xrayEnv });
+  xray.on('error', (e) => die(`[XRAY] Failed to start: ${e.message}`));
   children.push(xray);
   xray.on('exit', (code) => process.exit(code ?? 1));
 }
