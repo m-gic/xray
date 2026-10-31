@@ -213,7 +213,7 @@ async function unzip(zipPath, dir) {
 const GO_ENV = (() => {
   const limit = +(readText('/sys/fs/cgroup/memory.max').trim() || readText('/sys/fs/cgroup/memory/memory.limit_in_bytes').trim());
   return limit > 0 && limit < 2 ** 40
-    ? { GOGC: 'off', GOMEMLIMIT: `${Math.floor(limit * 0.6 / 1048576)}MiB` }
+    ? { GOGC: '100', GOMEMLIMIT: `${Math.floor(limit * 0.8 / 1048576)}MiB` }
     : { GOGC: '50' };
 })();
 
