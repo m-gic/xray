@@ -3,7 +3,7 @@
 // 纯 Node.js(>=16)，除自签证书需要系统 openssl 外仅使用内置模块
 const req = (m) => (typeof require === 'function' ? require(m) : process.getBuiltinModule(`node:${m}`));
 const crypto = req('crypto'), fs = req('fs'), path = req('path'), cp = req('child_process');
-const https = req('https'), http = req('http'), zlib = req('zlib'), dns = req('dns'), tls = req('tls');
+const https = req('https'), http = req('http'), zlib = req('zlib'), dns = req('dns'), tls = req('tls'), net = req('net');
 const { X509Certificate } = crypto, { pipeline } = req('stream').promises;
 const BASE_DIR = path.dirname(path.resolve(process.argv[1]));
 
@@ -80,7 +80,7 @@ process.chdir(WORK);
 const XHTTP_PATH = `/${sha256(`xhttp-path:${UUID}`).slice(0, 8)}`;
 const sha1Tag = crypto.createHash('sha1').update(BASE_DIR).digest('hex').slice(0, 8);
 const SOCK = Object.fromEntries(['vless-xhttp', 'cf-xhttp', 'front', 'web', 'tunnel-web'].map((n) => [n, `@xray-${sha1Tag}-${n}`]));
-const QUICK_TUNNEL_PORT = 8000, WG_CLIENT_ADDR = '10.0.0.2/32', TRACE = 'https://one.one.one.one/cdn-cgi/trace';
+const WG_CLIENT_ADDR = '10.0.0.2/32', TRACE = 'https://one.one.one.one/cdn-cgi/trace';
 
 // ========== 运行结果(只有运行时才能得到) ==========
 let CF_PORT = 0, CF_HOST = '', IPV6 = false, PUBLIC_ADDR = '';
@@ -102,6 +102,8 @@ function checkPorts(extra = []) {
 }
 
 function makePlan() {
+  if (TUNNEL === 'try') die("[CF] CLOUDFLARE_TUNNEL_TOKEN='try' is no longer supported. Leave it empty and set VLESS_MODE to include cloudflare to use a quick tunnel");
+
   const mode = { xhttp: false, cloudflare: false, reality: 0 };
   for (const t of CONFIG.VLESS_MODE.split(',').map((s) => s.trim()).filter(Boolean)) {
     if (t === 'ws') die("[MODE] VLESS_MODE: 'ws' is no longer supported, use xhttp");
@@ -129,15 +131,18 @@ function makePlan() {
   const hy2 = port('HYSTERIA2_MODE', CONFIG.HYSTERIA2_MODE, 'udp: hysteria2');
   const mixed = port('MIXED_MODE', CONFIG.MIXED_MODE, 'tcp: mixed (socks5 + http)');
   const wg = port('WIREGUARD_MODE', CONFIG.WIREGUARD_MODE, 'udp: wireguard');
-  const tunnel = !!TUNNEL;
   const reality = mode.reality;
+
+  // 规则零：cloudflare 模式有 token 时用固定隧道；没有 token 时自动使用临时隧道(Quick Tunnel)
+  const quick = mode.cloudflare && !TUNNEL;
+  const tunnel = !!TUNNEL || quick;
+  if (quick) console.log('[MODE] CLOUDFLARE_TUNNEL_TOKEN is empty: cloudflare mode uses a quick tunnel');
 
   // 规则一：xhttp 只走直连端口，与隧道互不影响
   const xhttp = mode.xhttp && !!direct;
   if (mode.xhttp && !direct) console.log('[MODE] PORT is empty: xhttp is disabled (xhttp needs a direct PORT)');
   // 规则一之二：cloudflare 模式的 xhttp 只走隧道，与直连 xhttp 互不影响
   const cfXhttp = mode.cloudflare && tunnel;
-  if (mode.cloudflare && !tunnel) console.log('[MODE] CLOUDFLARE_TUNNEL_TOKEN is empty: cloudflare mode is disabled');
   // 规则二：Web 由直连端口或隧道提供
   const web = !!(direct || tunnel);
   // 规则三：Reality 与直连端口相同时共用端口，由 Reality 回落到前置入口
@@ -152,7 +157,7 @@ function makePlan() {
   assertUnique([reality, !shareFront && direct, mixed]); // 隧道端口运行时才知道，startCloudflared 后再查一次
 
   return Object.freeze({
-    direct, tunnel, web, xhttp, cfXhttp, reality, hy2, mixed, wg, shareFront, frontTls, webDest,
+    direct, tunnel, quick, web, xhttp, cfXhttp, reality, hy2, mixed, wg, shareFront, frontTls, webDest,
     flow: reality ? 'xtls-rprx-vision' : '',
     // 规则六：只要有任何需要 Xray 的入口或协议，就运行 Xray；Komari 独立决定
     xray: web || !!reality || !!(hy2 || mixed || wg),
@@ -259,6 +264,15 @@ function spawnBg(bin, args, logFile, extra = {}) {
   children.push(child);
   return child;
 }
+
+// 取一个本机空闲 TCP 端口，避开 avoid 中的端口(计划中已确定的端口，此时尚未被占用)
+const freePort = (avoid = []) => new Promise((resolve, reject) => {
+  const s = net.createServer().on('error', reject);
+  s.listen(0, '127.0.0.1', () => {
+    const { port } = s.address();
+    s.close(() => (avoid.includes(port) ? freePort(avoid).then(resolve, reject) : resolve(port)));
+  });
+});
 
 // ========== TLS 证书 ==========
 // 自签证书(RSA 2048，10 年)；已有且 30 天内不过期则复用
@@ -383,7 +397,8 @@ function buildConfig() {
   if (plan.direct) inbounds.push(ib('front-in', plan.shareFront ? SOCK.front : '::', plan.shareFront ? undefined : plan.direct, 'vless',
     vlessSettings(fallbacks), plan.frontTls ? tlsStream('tcp', ['h2', 'http/1.1']) : TCP));
   if (plan.cfXhttp) inbounds.push(ib('vless-cf-xhttp-in', SOCK['cf-xhttp'], undefined, 'vless', vlessSettings(), xhttpStream(XHTTP_PATH)));
-  if (plan.tunnel) inbounds.push(ib('cf-front-in', '::', CF_PORT, 'vless',
+  // 隧道入口只供本机 cloudflared 访问，仅监听回环地址
+  if (plan.tunnel) inbounds.push(ib('cf-front-in', '127.0.0.1', CF_PORT, 'vless',
     vlessSettings([
       { path: `/${UUID}`, dest: SOCK['tunnel-web'], xver: 0 },
       // cloudflare 模式：其余请求交给 xhttp；否则全部回落到 Web
@@ -477,9 +492,14 @@ async function startKomari() {
   await new Promise(() => {});
 }
 
+// 从 cloudflared 日志取最后一条 "Updated to new configuration" 行
+function lastConfigLine(text) {
+  return text.split('\n').filter((l) => l.includes('Updated to new configuration')).pop() || '';
+}
+
 // 从 cloudflared 日志取第一条有具体域名、Service 为 http://localhost:端口 的 ingress 规则
 function parseIngress(text) {
-  const m = text.split('\n').filter((l) => l.includes('Updated to new configuration')).pop()?.match(/config="(.*)" version=/);
+  const m = lastConfigLine(text).match(/config="(.*)" version=/);
   if (!m) return null;
   let cfg;
   try { cfg = JSON.parse(m[1].replace(/\\"/g, '"')); } catch { return null; }
@@ -488,6 +508,17 @@ function parseIngress(text) {
     if (s) return { hostname: r.hostname, port: s[1] };
   }
   return null;
+}
+
+// 轮询日志直到 pick 返回真值；超时(30 秒)则打印日志末尾 20 行并退出
+async function waitForLog(logFile, pick, what) {
+  for (let i = 0; i < 30; i++) {
+    const v = pick(readText(logFile));
+    if (v) return v;
+    await sleep(1000);
+  }
+  const tail = readText(logFile).split('\n').slice(-20).join('\n');
+  die(`[CF] Timed out after 30s waiting for ${what}. Last lines of ${logFile}:\n${tail}`);
 }
 
 async function killAndFetchCf() {
@@ -500,22 +531,24 @@ async function killAndFetchCf() {
 
 async function startCloudflared() {
   const { bin, logFile } = await killAndFetchCf();
-  if (TUNNEL === 'try') {
-    CF_PORT = 8000;
+  if (plan.quick) {
+    // 端口由系统分配，并避开计划中已确定的端口
+    CF_PORT = await freePort([plan.direct, plan.reality, plan.mixed, plan.hy2, plan.wg]);
     checkPorts([CF_PORT]);
     spawnBg(bin, ['--no-autoupdate', 'tunnel', '--url', `http://localhost:${CF_PORT}`], logFile);
-    for (let i = 0; i < 30 && !CF_HOST; i++) {
-      CF_HOST = [...readText(logFile).matchAll(/https:\/\/([a-z0-9-]+\.trycloudflare\.com)/g)]
-        .map((m) => m[1]).find((h) => !h.startsWith('api.')) || '';
-      if (!CF_HOST) await sleep(1000);
-    }
-    if (!CF_HOST) die(`[CF] Cannot find the trycloudflare.com hostname in ${logFile}, exiting`);
+    CF_HOST = await waitForLog(logFile, (t) => [...t.matchAll(/https:\/\/([a-z0-9-]+\.trycloudflare\.com)/g)]
+      .map((m) => m[1]).find((h) => !h.startsWith('api.')) || '', 'the trycloudflare.com hostname');
     console.log(`[CF] Quick tunnel hostname: ${CF_HOST} (service port=${CF_PORT})`);
+    console.log('[CF] Quick Tunnel 域名每次启动都会变化，订阅链接需要重新获取；正式使用请改用固定隧道');
   } else {
     spawnBg(bin, ['--no-autoupdate', 'tunnel', 'run'], logFile, { TUNNEL_TOKEN: TUNNEL });
-    for (let i = 0; i < 30 && !readText(logFile).includes('Updated to new configuration'); i++) await sleep(1000);
-    const rule = parseIngress(readText(logFile));
-    if (!rule || !validPort(rule.port)) die(`[CF] Cannot read hostname / port from ${logFile} (needs a Public hostname without * and a Service like http://localhost:PORT), exiting`);
+    const text = await waitForLog(logFile, (t) => (t.includes('Updated to new configuration') ? t : ''), 'the tunnel configuration');
+    const rule = parseIngress(text);
+    if (!rule || !validPort(rule.port)) {
+      const line = lastConfigLine(text).slice(0, 200);
+      die(`[CF] Cannot read hostname / port from ${logFile} (needs a Public hostname without * and a Service like http://localhost:PORT), exiting.\n` +
+        `[CF] Matched config line (first 200 chars): ${line || '(none)'}`);
+    }
     CF_HOST = rule.hostname;
     CF_PORT = +rule.port;
     checkPorts([CF_PORT]);
@@ -530,7 +563,7 @@ async function main() {
 
   if (plan.xhttp || plan.cfXhttp || plan.reality) console.log(`[MODE] enabled=vless${plan.xhttp ? ' xhttp' : ''}${plan.cfXhttp ? ' cloudflare' : ''}${plan.reality ? ' reality' : ''}`);
   if (plan.direct) console.log(`[MODE] port ${plan.direct}: web${plan.xhttp ? ' + xhttp' : ''}${plan.shareFront ? ' shared with reality' : ''}`);
-  if (plan.tunnel) console.log(`[MODE] cloudflare tunnel (${TUNNEL === 'try' ? 'quick' : 'fixed'}): web${plan.cfXhttp ? ' + xhttp' : ''} (tunnel port decided by cloudflared log)`);
+  if (plan.tunnel) console.log(`[MODE] cloudflare tunnel (${plan.quick ? 'quick' : 'fixed'}): web${plan.cfXhttp ? ' + xhttp' : ''} (tunnel port decided by cloudflared log)`);
   if (plan.reality) console.log(`[MODE] port ${plan.reality}: reality`);
   if (!plan.xray && !plan.komari) die('[MODE] Nothing to run: set PORT, CLOUDFLARE_TUNNEL_TOKEN, VLESS_MODE / HYSTERIA2_MODE / MIXED_MODE / WIREGUARD_MODE, or KOMARI_ENDPOINT + KOMARI_TOKEN');
   if (plan.komari) await startKomari();
