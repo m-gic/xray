@@ -14,25 +14,24 @@ const validPort = (v) => /^\d+$/.test(v) && +v >= 1 && +v <= 65535;
 const nonEmpty = (f) => { try { return fs.statSync(f).size > 0; } catch { return false; } };
 const sha256 = (s) => crypto.createHash('sha256').update(s).digest('hex');
 const urlEncode = (t) => encodeURIComponent(t).replace(/[!'()*]/g, (c) => `%${c.charCodeAt(0).toString(16).toUpperCase()}`);
-const abs = (s) => `\0${s.slice(1)}`;
+const abs = (s) => `\0${s.slice(1)}`; // Xray 的 "@name" 抽象套接字 -> Node 的 "\0name"
 
-// ========== 用户配置(环境变量 > .env > 默认值) ==========
-const KEYS = [
-  'NAME',
-  'UUID',
-  'CLOUDFLARE_TUNNEL_TOKEN',
-  'PORT',
-  'CERT_HOST',
-  'VLESS_MODE',
-  'HYSTERIA2_MODE',
-  'MIXED_MODE',
-  'WIREGUARD_MODE',
-  'WORK_DIR',
-  'KOMARI_ENDPOINT',
-  'KOMARI_TOKEN',
-  'LOG_LEVEL',
-];
-const CONFIG = Object.fromEntries(KEYS.map((k) => [k, ''])); CONFIG.WORK_DIR = './'; CONFIG.LOG_LEVEL = 'warning';
+// ========== 用户配置(优先级：环境变量 > 同目录 .env > 默认值) ==========
+const CONFIG = {
+  NAME: '',
+  UUID: '',
+  CLOUDFLARE_TUNNEL_TOKEN: '',
+  PORT: '',
+  CERT_HOST: '',
+  VLESS_MODE: '',
+  HYSTERIA2_MODE: '',
+  MIXED_MODE: '',
+  WIREGUARD_MODE: '',
+  WORK_DIR: './',
+  KOMARI_ENDPOINT: '',
+  KOMARI_TOKEN: '',
+  LOG_LEVEL: 'warning',
+};
 
 try { process.loadEnvFile(path.join(BASE_DIR, '.env')); } catch {
   for (const [, k, v] of readText(path.join(BASE_DIR, '.env')).matchAll(/^\s*(?:export\s+)?([A-Za-z_]\w*)\s*=\s*(.*)$/gm)) {
@@ -40,11 +39,12 @@ try { process.loadEnvFile(path.join(BASE_DIR, '.env')); } catch {
     process.env[k] ??= raw.match(/^(['"])(.*?)\1/)?.[2] ?? raw.replace(/\s+#.*$/, '');
   }
 }
-for (const k of KEYS) CONFIG[k] = (process.env[k] ?? CONFIG[k]).trim();
+for (const k of Object.keys(CONFIG)) CONFIG[k] = (process.env[k] ?? CONFIG[k]).trim();
 CONFIG.PORT = CONFIG.PORT.replace(/^0+$/, '');
 CONFIG.CERT_HOST = CONFIG.CERT_HOST.replace(/^[a-z]+:\/\//i, '').replace(/[/:].*$/, '');
 CONFIG.VLESS_MODE = CONFIG.VLESS_MODE.toLowerCase();
 CONFIG.LOG_LEVEL = CONFIG.LOG_LEVEL.toLowerCase();
+// UUID 必须由用户提供：自动生成的 UUID 不会保存，每次启动都会变，订阅链接随之失效
 if (!CONFIG.UUID) die('[CONFIG] UUID is required, set it in the environment or in .env');
 for (const k of ['VMESS_MODE', 'TROJAN_MODE', 'SHADOWSOCKS_MODE']) if (process.env[k]) console.error(`[MODE] ${k} is no longer supported and is ignored`);
 
@@ -66,16 +66,18 @@ console.log(`[DIR] Work directory: ${WORK}`);
 process.chdir(WORK);
 
 // ========== 协议常量 ==========
+// xhttp 路径由 UUID 派生，固定且较短
 const XHTTP_PATH = `/${sha256(`xhttp-path:${UUID}`).slice(0, 8)}`;
 const sha1Tag = crypto.createHash('sha1').update(BASE_DIR).digest('hex').slice(0, 8);
 const SOCK = Object.fromEntries(['vless-xhttp', 'cf-xhttp', 'front', 'web', 'tunnel-web'].map((n) => [n, `@xray-${sha1Tag}-${n}`]));
 const WG_CLIENT_ADDR = '10.0.0.2/32', TRACE = 'https://one.one.one.one/cdn-cgi/trace';
 
+// ========== 运行结果(只有运行时才能得到) ==========
 let CF_PORT = 0, CF_HOST = '', IPV6 = false, PUBLIC_ADDR = '';
 let RK_PRIV = '', RK_PUB = '', SID = '', WGK = {};
 let CERT_FILE = '', KEY_FILE = '', TLS_NAME = '', TLS_INSECURE = true, PIN = '';
 
-// ========== 运行计划 ==========
+// ========== 运行计划：所有联动规则集中在 makePlan，推导一次后冻结 ==========
 let plan;
 
 function assertUnique(list) {
@@ -83,6 +85,7 @@ function assertUnique(list) {
   const dup = ports.find((p, i) => ports.indexOf(p) !== i);
   if (dup !== undefined) die(`[MODE] Port ${dup} is used more than once`);
 }
+// 运行时新增的端口(如隧道端口)用 extra 传入
 const checkPorts = (extra = []) => assertUnique([plan.reality, !plan.shareFront && plan.direct, plan.mixed, ...extra]);
 
 function makePlan() {
@@ -92,8 +95,8 @@ function makePlan() {
   for (const t of CONFIG.VLESS_MODE.split(',').map((s) => s.trim()).filter(Boolean)) {
     if (t === 'ws') die("[MODE] VLESS_MODE: 'ws' is no longer supported, use xhttp");
     if (t === 'xhttp' || t === 'cloudflare') {
-      if (mode[t === 'xhttp' ? 'xhttp' : 'cloudflare']) die(`[MODE] VLESS_MODE: '${t}' is given more than once`);
-      mode[t === 'xhttp' ? 'xhttp' : 'cloudflare'] = true;
+      if (mode[t]) die(`[MODE] VLESS_MODE: '${t}' is given more than once`);
+      mode[t] = true;
     } else if (/^\d+$/.test(t)) {
       if (!validPort(t)) die(`[MODE] VLESS_MODE='${t}': port must be 1-65535`);
       if (mode.reality) die('[MODE] VLESS_MODE: only one Reality port is allowed');
@@ -113,33 +116,44 @@ function makePlan() {
   const wg = port('WIREGUARD_MODE', CONFIG.WIREGUARD_MODE, 'udp: wireguard');
   const reality = mode.reality;
 
+  // 规则零：cloudflare 模式有 token 时用固定隧道；没有 token 时自动使用临时隧道(Quick Tunnel)
   const quick = mode.cloudflare && !TUNNEL;
   const tunnel = !!TUNNEL || quick;
   if (quick) console.log('[MODE] CLOUDFLARE_TUNNEL_TOKEN is empty: cloudflare mode uses a quick tunnel');
 
+  // 规则一：xhttp 只走直连端口，与隧道互不影响
   const xhttp = mode.xhttp && !!direct;
   if (mode.xhttp && !direct) console.log('[MODE] PORT is empty: xhttp is disabled (xhttp needs a direct PORT)');
+  // 规则一之二：cloudflare 模式的 xhttp 只走隧道
   const cfXhttp = mode.cloudflare && tunnel;
+  // 规则二：Web 由直连端口或隧道提供
   const web = !!(direct || tunnel);
+  // 规则三：Reality 与直连端口相同时共用端口，由 Reality 回落到前置入口
   const shareFront = !!direct && direct === reality;
+  // 规则四：只有直连端口上的 xhttp 或共用端口需要 TLS，隧道的 TLS 由 Cloudflare 终止
   const frontTls = !!direct && (xhttp || shareFront);
+  // 规则五：Web 回落目标只在直连端口且配置了 CERT_HOST 时存在
   const webDest = direct && CERT_HOST ? `${CERT_HOST}:80` : '';
   if (webDest && !/^[A-Za-z0-9.-]+:\d{1,5}$/.test(webDest)) die(`[WEB] CERT_HOST='${CERT_HOST}' is invalid (expected a domain or an IPv4 address)`);
   if (webDest) console.log(`[WEB] Fallback for other paths on the front port: ${webDest}`);
 
-  assertUnique([reality, !shareFront && direct, mixed]);
+  assertUnique([reality, !shareFront && direct, mixed]); // 隧道端口运行时才知道，startCloudflared 后再查一次
 
   return Object.freeze({
     direct, tunnel, quick, web, xhttp, cfXhttp, reality, hy2, mixed, wg, shareFront, frontTls, webDest,
     flow: reality ? 'xtls-rprx-vision' : '',
+    // 规则六：只要有任何需要 Xray 的入口或协议，就运行 Xray；Komari 独立决定
     xray: web || !!reality || !!(hy2 || mixed || wg),
     komari: !!(KOMARI_EP && KOMARI_TOKEN),
+    // 规则七：需要公网地址的场景
     net: !!(direct || reality || hy2 || mixed || wg),
+    // 规则八：需要自签或自有证书的场景
     tls: frontTls || !!hy2,
   });
 }
 
 // ========== 网络 / 文件 ==========
+// HTTPS 请求：跟随重定向；传 outputFile 则写入文件，否则返回 { status, body }
 function request(url, { family, timeout = 10000, outputFile, redirects = 5 } = {}) {
   return new Promise((resolve, reject) => {
     const r = https.get(url, { family }, (res) => {
@@ -163,6 +177,7 @@ function request(url, { family, timeout = 10000, outputFile, redirects = 5 } = {
   });
 }
 
+// 先写 .part 再改名，失败重试 3 次
 async function download(dest, url) {
   let err;
   for (let i = 0; i < 3; i++) {
@@ -180,6 +195,7 @@ async function fetchBin(name, url) {
   return bin;
 }
 
+// 流式解压 zip：只读中央目录，逐文件解压
 async function unzip(zipPath, dir) {
   const root = path.resolve(dir), fd = fs.openSync(zipPath, 'r'), size = fs.fstatSync(fd).size;
   const readAt = (len, pos) => { const b = Buffer.alloc(len); fs.readSync(fd, b, 0, len, pos); return b; };
@@ -206,6 +222,7 @@ async function unzip(zipPath, dir) {
   } finally { fs.closeSync(fd); }
 }
 
+// Go 程序内存参数：有容器内存限制时交给 GOMEMLIMIT，否则 GOGC=50 省内存
 const GO_ENV = (() => {
   const limit = +(readText('/sys/fs/cgroup/memory.max').trim() || readText('/sys/fs/cgroup/memory/memory.limit_in_bytes').trim());
   return limit > 0 && limit < 2 ** 40
@@ -231,6 +248,7 @@ function spawnBg(bin, args, logFile, extra = {}) {
   return child;
 }
 
+// 取一个本机空闲 TCP 端口，避开 avoid 中的端口
 const freePort = (avoid = []) => new Promise((resolve, reject) => {
   const s = net.createServer().on('error', reject);
   s.listen(0, '127.0.0.1', () => {
@@ -240,6 +258,7 @@ const freePort = (avoid = []) => new Promise((resolve, reject) => {
 });
 
 // ========== TLS 证书 ==========
+// 自签证书(RSA 2048，10 年)；已有且 30 天内不过期则复用
 function selfSigned(cn) {
   const dir = path.join(WORK, '.selfsigned');
   fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
@@ -253,6 +272,7 @@ function selfSigned(cn) {
   fs.chmodSync(KEY_FILE, 0o600);
 }
 
+// 校验证书链：域名匹配、逐级验签、最终落在系统信任根上；返回空串表示可信
 function verifyChain(chain, host) {
   if (!chain[0].checkHost(host)) return 'hostname mismatch';
   const roots = (tls.getCACertificates ? tls.getCACertificates('default') : tls.rootCertificates).map((p) => new X509Certificate(p));
@@ -295,7 +315,7 @@ function setupTls() {
   console.log(`[TLS] Server name: ${TLS_NAME}, insecure: ${TLS_INSECURE ? 1 : 0}, cert: ${CERT_FILE}`);
 }
 
-// ========== 密钥(由 UUID 派生) ==========
+// ========== 密钥(由 UUID 派生，同一 UUID 永远得到同一组密钥) ==========
 function deriveKey(label, enc) {
   const priv = crypto.createHash('sha256').update(`${label}:${UUID}`).digest();
   priv[0] &= 248;
@@ -306,6 +326,7 @@ function deriveKey(label, enc) {
   return [priv.toString(enc), Buffer.from(pub).toString(enc)];
 }
 
+// 公网地址：CERT_HOST 是 IP 直接用；是域名且指向本机时用域名；否则用探测到的出口 IP
 async function resolveAddr() {
   if (IPV4.test(CERT_HOST)) PUBLIC_ADDR = CERT_HOST;
   else {
@@ -332,6 +353,7 @@ const realityStream = (dest = 'www.iij.ad.jp:443', sn = 'www.iij.ad.jp') => ({
   network: 'tcp', security: 'reality',
   realitySettings: { show: false, dest, xver: 0, serverNames: [sn], privateKey: RK_PRIV, shortIds: [SID] },
 });
+// alpn 可以是字符串或数组
 const tlsStream = (network, alpn, extra = {}) => ({
   network, security: 'tls',
   tlsSettings: { serverName: TLS_NAME, alpn: [].concat(alpn), certificates: [{ certificateFile: CERT_FILE, keyFile: KEY_FILE }] },
@@ -343,18 +365,21 @@ const vlessSettings = (fallbacks, flow) => ({
 
 function buildConfig() {
   const inbounds = [];
+  // xhttp 走默认回落：Xray 的 fallback path 不支持 h2，xhttp 放在无 path 条件的最后一条
+  // 未开 xhttp 时，其余请求回落到 CERT_HOST 站点(若配置)，否则回落到 Node Web 服务(首页)
   const fallbacks = [
-    ...(plan.xhttp ? [] : [{ path: `/${UUID}`, dest: SOCK.web, xver: 0 }]),
+    { path: `/${UUID}`, dest: SOCK.web, xver: 0 },
     { dest: plan.xhttp ? SOCK['vless-xhttp'] : (plan.webDest || SOCK.web), xver: 0 },
   ];
-  if (plan.xhttp) fallbacks.unshift({ path: `/${UUID}`, dest: SOCK.web, xver: 0 });
   if (plan.xhttp) inbounds.push(ib('vless-xhttp-in', SOCK['vless-xhttp'], undefined, 'vless', vlessSettings(), xhttpStream(XHTTP_PATH)));
   if (plan.direct) inbounds.push(ib('front-in', plan.shareFront ? SOCK.front : '::', plan.shareFront ? undefined : plan.direct, 'vless',
     vlessSettings(fallbacks), plan.frontTls ? tlsStream('tcp', ['h2', 'http/1.1']) : TCP));
   if (plan.cfXhttp) inbounds.push(ib('vless-cf-xhttp-in', SOCK['cf-xhttp'], undefined, 'vless', vlessSettings(), xhttpStream(XHTTP_PATH)));
+  // 隧道入口只供本机 cloudflared 访问，仅监听回环地址
   if (plan.tunnel) inbounds.push(ib('cf-front-in', '127.0.0.1', CF_PORT, 'vless',
     vlessSettings([
       { path: `/${UUID}`, dest: SOCK['tunnel-web'], xver: 0 },
+      // cloudflare 模式：其余请求交给 xhttp；否则全部回落到 Web
       { dest: plan.cfXhttp ? SOCK['cf-xhttp'] : SOCK['tunnel-web'], xver: 0 },
     ]), TCP));
   if (plan.reality) inbounds.push(ib('vless-in', '::', plan.reality, 'vless', vlessSettings(undefined, plan.flow),
@@ -368,6 +393,7 @@ function buildConfig() {
 
   return {
     log: { loglevel: LOG },
+    // 空闲连接 180 秒后回收，降低长期占用的连接数与内存
     policy: { levels: { 0: { handshake: 4, connIdle: 180, uplinkOnly: 2, downlinkOnly: 5 } } },
     dns: { servers: ['https+local://1.1.1.1/dns-query'], queryStrategy: 'UseIPv4' },
     inbounds,
@@ -387,6 +413,7 @@ function buildConfig() {
 // ========== 订阅链接 ==========
 const realityLink = () => `vless://${UUID}@${PUBLIC_ADDR}:${plan.reality}?encryption=none${plan.flow ? `&flow=${plan.flow}` : ''}&security=reality&sni=${plan.shareFront ? TLS_NAME : 'www.iij.ad.jp'}&fp=chrome&pbk=${RK_PUB}&type=tcp&sid=${SID}#${N}`;
 
+// 直连 xhttp
 function frontNode() {
   if (!plan.xhttp) return [];
   const name = urlEncode(plan.reality || plan.cfXhttp ? `${NAME}-xhttp` : NAME);
@@ -394,6 +421,7 @@ function frontNode() {
   return [`vless://${UUID}@${PUBLIC_ADDR}:${plan.direct}?encryption=none&security=tls&sni=${TLS_NAME}&fp=chrome&type=xhttp&host=${TLS_NAME}&path=${urlEncode(XHTTP_PATH)}&mode=auto${insecure}#${name}`];
 }
 
+// Cloudflare xhttp：Cloudflare 终止 TLS，对外固定 443
 function cfNode() {
   if (!plan.cfXhttp) return [];
   const name = urlEncode(plan.reality || plan.xhttp ? `${NAME}-cloudflare` : NAME);
@@ -405,15 +433,16 @@ const mixedLinks = () => ['socks5', 'http'].map((s) => `${s}://${UUID}:${UUID}@$
 const wgLink = () => `wireguard://${urlEncode(WGK.cpriv)}@${PUBLIC_ADDR}:${plan.wg}?publickey=${urlEncode(WGK.spub)}&address=${urlEncode(WG_CLIENT_ADDR)}&mtu=1420#${N}`;
 const wgConfig = () => `[Interface]\nPrivateKey = ${WGK.cpriv}\nAddress = ${WG_CLIENT_ADDR}\nDNS = 1.1.1.1\nMTU = 1420\n\n[Peer]\nPublicKey = ${WGK.spub}\nEndpoint = ${PUBLIC_ADDR}:${plan.wg}\nAllowedIPs = 0.0.0.0/0, ::/0\nPersistentKeepalive = 25\n`;
 
-// ========== 内置 HTTP 服务 ==========
+// ========== 内置 HTTP 服务(只提供首页和订阅) ==========
+// xhttp 与 CERT_HOST 回落均由 Xray 完成，这里其余请求返回 404
 function startWeb(sock, subBody) {
   http.createServer((req, res) => {
     const pathname = req.url.split('?')[0];
+    const isGet = req.method === 'GET' || req.method === 'HEAD';
     const send = (status, type, body) => {
       res.writeHead(status, { 'Content-Type': type, 'Cache-Control': 'no-store' });
       res.end(req.method === 'HEAD' ? undefined : body);
     };
-    const isGet = req.method === 'GET' || req.method === 'HEAD';
     if (isGet && subBody && pathname === `/${UUID}`) return send(200, 'text/plain; charset=utf-8', subBody);
     if (isGet && pathname === '/') {
       const index = readText(path.join(BASE_DIR, 'index.html'));
@@ -441,8 +470,10 @@ async function startKomari() {
   await new Promise(() => {});
 }
 
+// 从 cloudflared 日志取最后一条 "Updated to new configuration" 行
 const lastConfigLine = (text) => text.split('\n').filter((l) => l.includes('Updated to new configuration')).pop() || '';
 
+// 从 cloudflared 日志取第一条有具体域名、Service 为 http://localhost:端口 的 ingress 规则
 function parseIngress(text) {
   const m = lastConfigLine(text).match(/config="(.*)" version=/);
   if (!m) return null;
@@ -455,6 +486,7 @@ function parseIngress(text) {
   return null;
 }
 
+// 轮询日志直到 pick 返回真值；超时(30 秒)则打印日志末尾 20 行并退出
 async function waitForLog(logFile, pick, what) {
   for (let i = 0; i < 30; i++) {
     const v = pick(readText(logFile));
@@ -472,6 +504,7 @@ async function startCloudflared() {
   cp.spawnSync(bin, ['--version'], { stdio: STDIO });
   const logFile = path.join(WORK, `${svc}.log`);
   if (plan.quick) {
+    // 端口由系统分配，并避开计划中已确定的端口
     CF_PORT = await freePort([plan.direct, plan.reality, plan.mixed, plan.hy2, plan.wg]);
     checkPorts([CF_PORT]);
     spawnBg(bin, ['--no-autoupdate', 'tunnel', '--url', `http://localhost:${CF_PORT}`], logFile);
@@ -496,7 +529,7 @@ async function startCloudflared() {
   if (LOG === 'none') fs.rmSync(logFile, { force: true });
 }
 
-// ========== 主流程 ==========
+// ========== 主流程(线性，只读取 plan) ==========
 async function main() {
   plan = makePlan();
 
@@ -507,6 +540,7 @@ async function main() {
   if (!plan.xray && !plan.komari) die('[MODE] Nothing to run: set PORT, CLOUDFLARE_TUNNEL_TOKEN, VLESS_MODE / HYSTERIA2_MODE / MIXED_MODE / WIREGUARD_MODE, or KOMARI_ENDPOINT + KOMARI_TOKEN');
   if (plan.komari) await startKomari();
 
+  // 密钥
   if (plan.reality) {
     [RK_PRIV, RK_PUB] = deriveKey('reality', 'base64url');
     SID = sha256(`reality-short-id:${UUID}`).slice(0, 8);
@@ -517,12 +551,14 @@ async function main() {
     WGK = { sp, spub, cpriv, cpub };
   }
 
+  // 运行环境
   if (plan.net) await resolveAddr();
   IPV6 = await request(TRACE, { family: 6, timeout: 5000 }).then(() => true, () => false);
   console.log(IPV6 ? '[NET] IPv6 egress: available' : '[NET] IPv6 egress: unavailable, blocking IPv6 destinations');
   if (plan.tls) setupTls();
   if (plan.tunnel) await startCloudflared();
 
+  // Xray
   const xrayBin = path.join(WORK, `xray-${hp}`), cfgFile = path.join(WORK, 'config.json'), zip = path.join(WORK, 'xray.zip');
   await killPrevious(`xray-${hp}`, 'XRAY');
   if (!await download(zip, `https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-${ARCH === 'amd64' ? '64' : 'arm64-v8a'}.zip`)) process.exit(1);
@@ -533,10 +569,12 @@ async function main() {
   fs.chmodSync(xrayBin, 0o755);
   const xrayEnv = { ...process.env, ...GO_ENV, XRAY_LOCATION_ASSET: WORK };
 
+  // 先以 600 权限写入(含 UUID 和 Reality 私钥)，再测试配置
   fs.writeFileSync(cfgFile, `${JSON.stringify(buildConfig(), null, 2)}\n`, { mode: 0o600 });
   fs.chmodSync(cfgFile, 0o600);
   if (cp.spawnSync(xrayBin, ['run', '-test', '-c', cfgFile], { stdio: STDIO, env: xrayEnv }).status !== 0) die('[XRAY] Config test failed, aborting');
 
+  // 订阅输出
   const allNodes = [plan.reality && realityLink(), ...frontNode(), ...cfNode(), plan.hy2 && hy2Link(), plan.wg && wgLink(), plan.mixed && mixedLinks()]
     .filter(Boolean).map((n) => `${n}\n`).join('');
   const subscription = Buffer.from(allNodes).toString('base64');
@@ -552,6 +590,7 @@ async function main() {
     if (allNodes && bases.length) console.log(`\n=== Subscription URL ===\n${bases.map((b) => `${b}/${UUID}`).join('\n')}${plan.frontTls && TLS_INSECURE ? '\n(自签证书：客户端需要允许不校验证书)' : ''}\n`);
   }
 
+  // systemd 服务文件(限制 Node 自身堆内存)
   const svcName = `cache-${uuidHash.slice(0, 6)}`, svcFile = path.join(WORK, `${svcName}.service`);
   fs.writeFileSync(svcFile, `[Unit]\nDescription=${svcName}\nAfter=network.target\n\n[Service]\nType=simple\nRestart=always\nRestartSec=5\nWorkingDirectory=${WORK}\nExecStart=${process.execPath} --max-old-space-size=48 ${path.resolve(process.argv[1])}\nKillMode=mixed\nKillSignal=SIGTERM\n\n[Install]\nWantedBy=multi-user.target\n`);
   console.log(`\n=== systemd service (${svcName}) ===\ncp ${svcFile} /etc/systemd/system/${svcName}.service\nsystemctl daemon-reload && systemctl enable --now ${svcName}`);
