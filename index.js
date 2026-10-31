@@ -1,17 +1,17 @@
 #!/usr/bin/env node
 'use strict';
-const req = typeof require === 'function' ? require : (m) => process.getBuiltinModule(`node:${m}`);
+const req = (m) => (typeof require === 'function' ? require(m) : process.getBuiltinModule(`node:${m}`));
 const crypto = req('crypto'), fs = req('fs'), path = req('path'), cp = req('child_process');
-const [https, http, zlib, dns, tls, net] = ['https', 'http', 'zlib', 'dns', 'tls', 'net'].map((m) => req(m));
+const https = req('https'), http = req('http'), zlib = req('zlib'), dns = req('dns'), tls = req('tls'), net = req('net');
 const { X509Certificate } = crypto, { pipeline } = req('stream').promises;
 const BASE_DIR = path.dirname(path.resolve(process.argv[1]));
 
 const readText = (f) => { try { return fs.readFileSync(f, 'utf8'); } catch { return ''; } };
-const nonEmpty = (f) => { try { return fs.statSync(f).size > 0; } catch { return false; } };
 const die = (msg) => { console.error(msg); process.exit(1); };
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const IPV4 = /^\d{1,3}(\.\d{1,3}){3}$/;
 const validPort = (v) => /^\d+$/.test(v) && +v >= 1 && +v <= 65535;
+const nonEmpty = (f) => { try { return fs.statSync(f).size > 0; } catch { return false; } };
 const sha256 = (s) => crypto.createHash('sha256').update(s).digest('hex');
 const urlEncode = (t) => encodeURIComponent(t).replace(/[!'()*]/g, (c) => `%${c.charCodeAt(0).toString(16).toUpperCase()}`);
 const abs = (s) => `\0${s.slice(1)}`; // Xray 的 "@name" 抽象套接字 -> Node 的 "\0name"
@@ -22,6 +22,7 @@ const CONFIG = {
   UUID: '',
   CLOUDFLARE_TUNNEL_TOKEN: '',
   CLOUDFLARE_PROTOCOL: 'auto',
+  CLOUDFLARE_IP: 'www.gov.tw',
   PORT: '',
   CERT_HOST: '',
   VLESS_MODE: '',
@@ -395,15 +396,14 @@ const realityLink = () => `vless://${UUID}@${PUBLIC_ADDR}:${plan.reality}?encryp
 
 function frontNode() {
   if (!plan.xhttp) return [];
-  const name = urlEncode(plan.reality || plan.cfXhttp ? `${NAME}-xhttp` : NAME);
   const insecure = TLS_INSECURE ? `&allowInsecure=1&pcs=${PIN}` : '';
-  return [`vless://${UUID}@${PUBLIC_ADDR}:${plan.direct}?encryption=none&security=tls&sni=${TLS_NAME}&fp=chrome&type=xhttp&host=${TLS_NAME}&path=${urlEncode(XHTTP_PATH)}&mode=auto${insecure}#${name}`];
+  return [`vless://${UUID}@${PUBLIC_ADDR}:${plan.direct}?encryption=none&security=tls&sni=${TLS_NAME}&fp=chrome&type=xhttp&host=${TLS_NAME}&path=${urlEncode(XHTTP_PATH)}&mode=auto${insecure}#${N}`];
 }
 
 function cfNode() {
   if (!plan.cfXhttp) return [];
-  const name = urlEncode(plan.reality || plan.xhttp ? `${NAME}-cloudflare` : NAME);
-  return [`vless://${UUID}@${CF_HOST}:443?encryption=none&security=tls&sni=${CF_HOST}&alpn=h2&fp=chrome&type=xhttp&host=${CF_HOST}&path=${urlEncode(XHTTP_PATH)}&mode=auto#${name}`];
+  const addr = CONFIG.CLOUDFLARE_IP || CF_HOST;
+  return [`vless://${UUID}@${addr}:443?encryption=none&security=tls&sni=${CF_HOST}&alpn=h2&fp=chrome&type=xhttp&host=${CF_HOST}&path=${urlEncode(XHTTP_PATH)}&mode=auto#${N}`];
 }
 
 const hy2Link = () => `hysteria2://${UUID}@${PUBLIC_ADDR}:${plan.hy2}/?sni=${TLS_NAME}${TLS_INSECURE ? '&insecure=1' : ''}#${N}`;
