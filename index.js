@@ -180,6 +180,8 @@ async function fetchBin(name, url) {
   const bin = path.join(WORK, name);
   if (!await download(bin, url)) process.exit(1);
   fs.chmodSync(bin, 0o755);
+  try { fs.accessSync(bin, fs.constants.X_OK); }
+  catch { die(`[BIN] ${bin} is not executable (noexec mount or permission issue). Set WORK_DIR to an exec-enabled directory.`); }
   return bin;
 }
 
@@ -230,6 +232,7 @@ async function killPrevious(name, tag) {
 function spawnBg(bin, args, logFile, extra = {}) {
   const fd = fs.openSync(logFile, 'w');
   const child = cp.spawn(bin, args, { env: { ...process.env, ...GO_ENV, ...extra }, stdio: ['ignore', fd, fd] });
+  child.on('error', (e) => console.error(`[PROC] Failed to start ${path.basename(bin)}: ${e.message}`));
   fs.closeSync(fd);
   children.push(child);
   return child;
@@ -443,6 +446,7 @@ async function startKomari() {
   }
   console.log(`[KOMARI] No proxy protocol enabled, running the agent only, reporting to ${KOMARI_EP}`);
   const child = cp.spawn(bin, [], { env: { ...process.env, ...GO_ENV, ...extra }, stdio: STDIO });
+  child.on('error', (e) => die(`[KOMARI] Failed to start agent: ${e.message}`));
   children.push(child);
   child.on('exit', (code) => process.exit(code ?? 1));
   await new Promise(() => {});
