@@ -248,7 +248,7 @@ const freePort = (avoid = []) => new Promise((resolve, reject) => {
 });
 
 // ========== TLS 证书 ==========
-// 自签证书(RSA 2048，10 年)；已有且 30 天内不过期则复用
+// 纯 JS 自签证书(ECDSA P-256，10 年)，不依赖 openssl；已有且 30 天内不过期则复用
 function selfSigned(cn) {
   const dir = path.join(WORK, '.selfsigned');
   fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
@@ -257,8 +257,29 @@ function selfSigned(cn) {
   if (nonEmpty(CERT_FILE) && nonEmpty(KEY_FILE)) {
     try { if (Date.parse(new X509Certificate(fs.readFileSync(CERT_FILE)).validTo) - Date.now() > 30 * 86400e3) return; } catch {}
   }
-  cp.execFileSync('openssl', ['req', '-x509', '-newkey', 'rsa:2048', '-nodes', '-days', '3650',
-    '-keyout', KEY_FILE, '-out', CERT_FILE, '-subj', `/CN=${cn}`, '-addext', `subjectAltName=DNS:${cn},DNS:localhost`], { stdio: 'ignore' });
+  const der = (tag, ...c) => {
+    const body = Buffer.concat(c), n = body.length;
+    const len = n < 128 ? [n] : n < 256 ? [0x81, n] : [0x82, n >> 8, n & 255];
+    return Buffer.concat([Buffer.from([tag, ...len]), body]);
+  };
+  const oid = (hex) => der(0x06, Buffer.from(hex, 'hex'));
+  const name = der(0x30, der(0x31, der(0x30, oid('550403'), der(0x0c, Buffer.from(cn)))));
+  const utc = (d) => der(0x17, Buffer.from(d.toISOString().replace(/[-:T]/g, '').slice(2, 14) + 'Z'));
+  const now = new Date(Date.now() - 86400e3), end = new Date(now.getTime() + 3650 * 86400e3);
+  const { privateKey, publicKey } = crypto.generateKeyPairSync('ec', { namedCurve: 'P-256' });
+  const serial = crypto.randomBytes(16); serial[0] = (serial[0] & 0x7f) | 0x01;
+  const sigAlg = der(0x30, oid('2a8648ce3d040302')); // ecdsa-with-SHA256
+  const san = [der(0x82, Buffer.from(cn)), der(0x82, Buffer.from('localhost'))];
+  if (IPV4.test(cn)) san[0] = der(0x87, Buffer.from(cn.split('.').map(Number)));
+  const ext = der(0xa3, der(0x30, der(0x30, oid('551d11'), der(0x04, der(0x30, ...san)))));
+  const tbs = der(0x30,
+    der(0xa0, der(0x02, Buffer.from([2]))), der(0x02, serial), sigAlg, name,
+    der(0x30, utc(now), utc(end)), name, publicKey.export({ type: 'spki', format: 'der' }), ext);
+  const sig = crypto.sign('sha256', tbs, privateKey);
+  const cert = der(0x30, tbs, sigAlg, der(0x03, Buffer.concat([Buffer.from([0]), sig])));
+  const pem = (label, buf) => `-----BEGIN ${label}-----\n${buf.toString('base64').match(/.{1,64}/g).join('\n')}\n-----END ${label}-----\n`;
+  fs.writeFileSync(KEY_FILE, privateKey.export({ type: 'pkcs8', format: 'pem' }), { mode: 0o600 });
+  fs.writeFileSync(CERT_FILE, pem('CERTIFICATE', cert));
   fs.chmodSync(KEY_FILE, 0o600);
 }
 
