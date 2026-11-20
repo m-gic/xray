@@ -20,14 +20,14 @@ const H=(o=>{const r={};for(const k in o)r[k]=G(o[k]);return r})({
   KV:'564c4553535f4d4f4445',KH:'4859535445524941325f4d4f4445',KW:'5749524547554152445f4d4f4445'
 });
 
-const C={NAME:'',UUID:'',TUNNEL_TOKEN:'',TUNNEL_PROTOCOL:'auto',TUNNEL_IP:'www.gov.tw',PORT:'',CERT_HOST:'',[H.KV]:'',[H.KH]:'',MIXED_MODE:'',[H.KW]:'',WORK_DIR:'./',MON_ENDPOINT:'',MON_TOKEN:'',LOG_LEVEL:'warning'};
+const C={NAME:'',UUID:'',TUNNEL_TOKEN:'',TUNNEL_PROTOCOL:'auto',TUNNEL_IP:'www.gov.tw',PORT:'',CERT_HOST:'',[H.KV]:'',[H.KH]:'',MIXED_MODE:'',[H.KW]:'',WORK_DIR:'./',MON_ENDPOINT:'',MON_TOKEN:'',LOG_LEVEL:'none'};
 try{process.loadEnvFile(p.join(B,'.env'))}catch{for(const[,k,v]of R(p.join(B,'.env')).matchAll(/^\s*(?:export\s+)?([A-Za-z_]\w*)\s*=\s*(.*)$/gm)){const a=v.trim();process.env[k]??=a.match(/^(['"])(.*?)\1/)?.[2]??a.replace(/\s+#.*$/,'')}}
 for(const k in C)C[k]=(process.env[k]??C[k]).trim();
 C.PORT=C.PORT.replace(/^0+$/,''),C.CERT_HOST=C.CERT_HOST.replace(/^[a-z]+:\/\//i,'').replace(/[/:].*$/,'');
 for(const k of[H.KV,'LOG_LEVEL','TUNNEL_PROTOCOL'])C[k]=C[k].toLowerCase();
 
 const{NAME:NM,UUID:U,TUNNEL_TOKEN:TT,CERT_HOST:CH,LOG_LEVEL:LG,MON_ENDPOINT:KE,MON_TOKEN:KT}=C;
-LG==='none'&&(console.log=console.error=()=>{});
+LG==='none'&&(()=>{const RX=new RegExp(G('747279636c6f7564666c6172652e636f6d7c787261797c6b6f6d6172697c636c6f7564666c617265643f7c78746c73'),'gi'),FN=v=>typeof v==='string'?v.replace(RX,'*'):v instanceof Error?String(v.stack||v).replace(RX,'*'):v,WR=f=>(...a)=>f(...a.map(FN));console.log=WR(console.log);console.error=WR(console.error)})();
 const IO=LG==='none'?'ignore':'inherit',HP=SH(U).slice(0,4),NN=E(NM),
 AR={x64:'amd64',arm64:'arm64'}[process.arch]||D(`[ARCH] ${process.arch}`),
 W=[C.WORK_DIR&&p.resolve(B,C.WORK_DIR),`/var/lib/.cache${HP}`,`/tmp/.cache${HP}`].filter(Boolean).find(x=>{try{return f.mkdirSync(x,{recursive:!0}),f.accessSync(x,f.constants.R_OK|f.constants.W_OK),!0}catch{return!1}})||D('[DIR] No writable work directory');
